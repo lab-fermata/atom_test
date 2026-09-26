@@ -45,6 +45,7 @@
 #define DIAL_BAUD        115200
 #define DIAL_LINE_MAX    160  // 受信1行の最大バイト数（超えた行は捨てる）
 #define BT_DEVICE_NAME   "fermata BT Speaker"
+#define META_TEXT_MAX    256  // @META 1項目の最大バイト数（UTF-8、超えた分は切り捨て）
 
 #define LED_LEVEL        64   // 点灯時の輝度（0-255。本体LEDは明るいので控えめ）
 #define LED_BLINK_MS     1000 // ゆっくり点滅の半周期

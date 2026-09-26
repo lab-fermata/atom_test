@@ -93,7 +93,7 @@ void dialSendDisconnected() {
 }
 
 void dialSendMeta(const char* id, const char* text) {
-  char buf[512];
+  char buf[META_TEXT_MAX * 2 + 32];  // 全文字がエスケープされても入る大きさ
   size_t n = 0;
   const size_t cap = sizeof(buf) - 3;
   n = appendRaw(buf, n, cap, "@META{\"");
