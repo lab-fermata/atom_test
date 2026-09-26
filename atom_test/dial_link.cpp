@@ -23,7 +23,7 @@ void dialBegin(bool enableUart) {
 #if DIAL_IN_PORT == DIAL_PORT_UART
     Serial1.begin(DIAL_BAUD, SERIAL_8N1, PIN_DIAL_RX, PIN_DIAL_TX);
 #else
-    // 受信しないので RX ピンを割り当てない（未接続の G32 のノイズを UART に入れないため）。
+    // 受信しないので RX ピンを割り当てない（未接続の G26 のノイズを UART に入れないため）。
     // rxPin=-1 は HardwareSerial::begin / uartSetPins で「割り当てなし」として扱われる。
     Serial1.begin(DIAL_BAUD, SERIAL_8N1, -1, PIN_DIAL_TX);
 #endif
@@ -138,8 +138,6 @@ static void parse(char* line, DialCmd& cmd) {
   size_t len = strlen(line);
   if (strcmp(line, "STATUS") == 0) {
     cmd.type = CMD_STATUS;
-  } else if (strcmp(line, "SLEEP") == 0) {
-    cmd.type = CMD_SLEEP;
   } else if (strcmp(line, "KILL") == 0) {
     cmd.type = CMD_KILL;
   } else if (strcmp(line, "REBOOT") == 0) {

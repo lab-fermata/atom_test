@@ -2,7 +2,7 @@
 //
 // - 115200bps 8N1、UTF-8。1行 = 1メッセージ、終端 "\n"（受信時の "\r" は無視）
 // - 文字列中の " と \ はバックスラッシュでエスケープする
-// - イベント（@...）は USB（Serial）と製品用 UART（Serial1: TX=G26/RX=G32）の両方へ出す
+// - イベント（@...）は USB（Serial）と製品用 UART（Serial1: TX=G32/RX=G26）の両方へ出す
 // - コマンドは DIAL_IN_PORT で選んだポートからだけ受信する
 // - デバッグログは USB 側にだけ "#" で始まる行として出す
 #pragma once
@@ -12,7 +12,6 @@
 enum DialCmdType {
   CMD_NONE,
   CMD_STATUS,
-  CMD_SLEEP,
   CMD_KILL,
   CMD_REBOOT,
   CMD_IR,       // arg にキー

@@ -24,9 +24,6 @@ static void handleCommand(const DialCmd& cmd) {
       Serial1.flush();
       ESP.restart();
       break;
-    case CMD_SLEEP:
-      LOG1("stub: SLEEP");
-      break;
     case CMD_IR:
       LOG1("stub: IR{%s}", cmd.arg);
       break;

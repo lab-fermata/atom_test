@@ -13,7 +13,7 @@
 
 // M5Dial からのコマンドを受信するポート（送信は常に両方へ出す）
 #define DIAL_PORT_USB  0  // Serial（UART0、USB）
-#define DIAL_PORT_UART 1  // Serial1（Grove、TX=G26/RX=G32）
+#define DIAL_PORT_UART 1  // Serial1（Grove、TX=G32/RX=G26）
 #ifndef DIAL_IN_PORT
 #define DIAL_IN_PORT DIAL_PORT_USB
 #endif
@@ -32,8 +32,8 @@
 #define PIN_I2S_BCK   22  // RX: → PCM5122 BCK   / TX: ← CS8416 OSCLK
 #define PIN_I2S_WS    19  // RX: → PCM5122 LRCK  / TX: ← CS8416 OLRCK
 #define PIN_I2S_DATA  23  // RX: → PCM5122 DIN   / TX: ← CS8416 SDOUT
-#define PIN_DIAL_TX   26  // RX: UART TXD → M5Dial（Grove 黄）
-#define PIN_DIAL_RX   32  // RX: UART RXD ← M5Dial（Grove 白）
+#define PIN_DIAL_TX   32  // RX: UART TXD → M5Dial G1（Grove 白）
+#define PIN_DIAL_RX   26  // RX: UART RXD ← M5Dial G2（Grove 黄）
 #define PIN_RERR      33  // TX: ← CS8416 RERR
 #define PIN_IR_RX     33  // RX: ← Unit IR
 #define PIN_ROLE      25  // 判定ジャンパ（H=RX / L=TX）
