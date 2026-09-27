@@ -14,6 +14,7 @@ enum DialCmdType {
   CMD_STATUS,
   CMD_KILL,
   CMD_REBOOT,
+  CMD_SLEEP,
   CMD_IR,       // arg にキー
   CMD_UNKNOWN,  // arg に受信行
 };

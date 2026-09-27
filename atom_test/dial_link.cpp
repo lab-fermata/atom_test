@@ -142,6 +142,8 @@ static void parse(char* line, DialCmd& cmd) {
     cmd.type = CMD_KILL;
   } else if (strcmp(line, "REBOOT") == 0) {
     cmd.type = CMD_REBOOT;
+  } else if (strcmp(line, "SLEEP") == 0) {
+    cmd.type = CMD_SLEEP;
   } else if (len >= 4 && strncmp(line, "IR{", 3) == 0 && line[len - 1] == '}') {
     cmd.type = CMD_IR;
     size_t klen = len - 4;

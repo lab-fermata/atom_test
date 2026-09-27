@@ -23,6 +23,12 @@
 #define RESTART_ON_DISCONNECT 1
 #endif
 
+// 1: SLEEP の Deep Sleep 中、本体ボタン（G39）でも起床する（デバッグ用、ext1）。
+//    本来のウェイク要因は G26 の Low（ext0、software.md 3.2節）
+#ifndef SLEEP_WAKE_BUTTON
+#define SLEEP_WAKE_BUTTON 1
+#endif
+
 // 0: なし / 1: 通常 / 2: 詳細（USB側だけに "#" 行で出す）
 #ifndef LOG_LEVEL
 #define LOG_LEVEL 1
@@ -33,7 +39,7 @@
 #define PIN_I2S_WS    19  // RX: → PCM5122 LRCK  / TX: ← CS8416 OLRCK
 #define PIN_I2S_DATA  23  // RX: → PCM5122 DIN   / TX: ← CS8416 SDOUT
 #define PIN_DIAL_TX   32  // RX: UART TXD → M5Dial G1（Grove 白）
-#define PIN_DIAL_RX   26  // RX: UART RXD ← M5Dial G2（Grove 黄）
+#define PIN_DIAL_RX   26  // RX: UART RXD ← M5Dial G2（Grove 黄）。Deep Sleep 中は ext0 ウェイク入力
 #define PIN_RERR      33  // TX: ← CS8416 RERR
 #define PIN_IR_RX     33  // RX: ← Unit IR
 #define PIN_ROLE      25  // 判定ジャンパ（H=RX / L=TX）
