@@ -1,0 +1,288 @@
+# atom_tx_test — TX 側 AtomLite の機能テスト（BT 接続・A2DP Source）
+
+指示書: [atom_tx_test_instructions.md](atom_tx_test_instructions.md)。S/PDIF（I2S）は使わず、正弦波のダミーを送る。確認が取れたら `BT_SPEAKER/atom_a2dp/` に合体する。
+
+## ビルド・書き込み
+
+```bash
+cd C:\workspace\MAKER\atom_test
+arduino-cli compile --fqbn m5stack:esp32:m5stack_atom:UploadSpeed=115200 atom_tx_test
+arduino-cli upload -p COM7 --fqbn m5stack:esp32:m5stack_atom:UploadSpeed=115200 atom_tx_test
+```
+
+- 書き込みの前に `arduino-cli board list` で COM ポートを確かめる。TX は USB 給電だけで、M5Dial・Grove はつながない。書き込み中は RX の電源を切る
+- ログは USB シリアル（115200bps）に `#` の行で出る。DTR・RTS を無効にして開く（`BT_SPEAKER/tools/serial_log.ps1`。出力は `atom_tx_test/logs/` へ）
+- 設定は `config.h` のマクロ。`--build-property "compiler.cpp.extra_flags=-DTONE_MODE=1 -DTONE_FIXED_HZ=1000"` のように `-D` で上書きできる（`LOG_LEVEL` を除く）
+
+### 使ったバージョン（BT_SPEAKER/docs/dev-env.md と同じ。試験中は更新しない）
+
+| 項目 | バージョン |
+|---|---|
+| arduino-cli | 1.5.2-rc.1 |
+| コア `m5stack:esp32` | 3.3.9 |
+| M5Unified | 0.2.24 |
+| ESP32-A2DP | 1.8.11 |
+| audio-tools | 1.2.6（インストール済みだが、このスケッチでは include しない） |
+
+## 動作
+
+| 項目 | 内容 |
+|---|---|
+| 接続先 | `"fermata BT Speaker"`（`BT_DEVICE_NAME`。前方一致、大文字小文字を区別） |
+| 自分の名前 | `"fermata SPDIF"`（`BT_TX_LOCAL_NAME`） |
+| 再接続 | `set_auto_reconnect(true)`。初回は名前でスキャンし、以降は NVS に保存したアドレスへ直接接続 |
+| LED | 接続待ち: 青の点滅、接続中: 青の点灯。模擬エラー中は青の代わりに赤（点滅／点灯） |
+| ボタン（G39） | 短押し（3秒未満、離したとき）: 模擬エラーの ON/OFF（`TX_SIM_ERROR_BUTTON=0` で外す）。3秒長押し: LED を消して `ESP.restart()` |
+| 切断 | 一度接続した後の DISCONNECTED で、`TX_RESTART_DELAY_MS`（300ms）待って `ESP.restart()` |
+| 音声 | 44.1kHz・16bit・2ch。−20dBFS の正弦波。100／200／400／800／1600／3200／6300／12500Hz を3秒ずつ（`TONE_MODE=1` で `TONE_FIXED_HZ` に固定）。L=R（`TONE_CHANNEL` 1=L のみ、2=R のみ）。周波数の切り替えでは位相を連続にする |
+| 正弦波の作り方 | 1024点のテーブル＋線形補間（補間の誤差は約 −118dB）。`TONE_USE_SINF=1` で `sinf()`（処理時間を比べる用） |
+
+- 接続したときに、掃引を 100Hz からやり直す
+- AVRCP: software.md 1節の「TX は AVRCP Target として空のメタデータを返す」は扱わない（ライブラリの既定のまま）
+
+### ログ
+
+- 起動時: `A2DP source started: … saved peer XX:…`（NVS に保存された前回の接続先。`none (scan by name)` なら名前でのスキャン）
+- 変化したとき: `tone <Hz> Hz`、`connected: <アドレス> after <ms> ms from start()`、`audio state: …`、`simulated error: ON/OFF`、`restart: …`
+- 1秒ごと（`LOG_LEVEL` 2）: `<接続状態>, <音声状態>, tone <Hz> Hz, frames <n>/s (calls <n>, max <n> frames, cb max <µs>us), heap <空き> min <最小値>`
+
+## 構成と atom_a2dp との差分
+
+| ファイル | 内容 | コピー元（BT_SPEAKER） |
+|---|---|---|
+| `atom_tx_test.ino` | 役割の判定 → `M5.begin()` → 共通部 → `txSetup()`／`txLoop()` | `atom_a2dp/atom_a2dp.ino`（c1d9300）。Deep Sleep からの起床の処理（RX）を外した |
+| `config.h` | 共通・RX（コメントのみ）・TX の節 | `atom_a2dp/config.h`（c0b5439） |
+| `role.*` | 役割の判定 | `atom_a2dp/role.*`（c1d9300）。変更なし |
+| `status_led.*` | 本体 LED | `atom_a2dp/status_led.*`（c1d9300）。`LED_RED_BLINK` を足した |
+| `dial_link.*` | ログ（`LOG1`／`LOG2`）だけの最小版 | `atom_a2dp/dial_link.*`（54971ea）の `dialBegin()`・`dialLog()` |
+| `tx_main.*` | TX の入口: 状態、LED、ボタン、切断時の再起動 | 新規（`rx_main.*` の形） |
+| `tx_audio.*` | A2DP Source、正弦波、接続状態の記録、1秒ごとのログ | 新規（`rx_audio.*` の形） |
+
+- `config.h`: `ROLE` の既定を `ROLE_TX` にした（atom_a2dp は `ROLE_AUTO`）。G25 は読まない（開放のまま）。`BT_DEVICE_NAME` を RX の節から共通の節に移した
+- `dial_link.*`: atom_a2dp のものをそのまま使うと、RX の節のマクロ（`EQ_BANDS`・`DIAL_LINE_MAX`・`DEBUG_CMD` など）が要るので、TX が使う関数だけを同じ名前・シグネチャで残した。ボーレートは 115200 を直接書いた（atom_a2dp は `DIAL_BAUD`）
+- `status_led.*`: `LED_RED_BLINK` を足し、`ledUpdate()` で青と赤の両方の点滅を扱う
+
+## 合体時に決める事項
+
+仕様に関わること:
+
+- **赤の扱い**: 決定（2026-10-03、ユーザー）。混色にせず、色（赤・青）で S/PDIF のエラーの有無、点滅・点灯で BT の接続状態を表す（このスケッチの表示のとおり）。software.md 2.4節・OI-20 の更新はユーザーの確認の後
+- 模擬エラーのボタン（`TX_SIM_ERROR_BUTTON`）: 決定（2026-10-03、ユーザー）。TX/RX の全体の確認が終わるまで残し、終わったら外す。長押しで再起動した後のボタンの扱い（「分かったこと」）は、確認のときだけの機能なので気にしない
+- ボタンの長押し（3秒）で再起動する機能を製品の TX に残すか（software.md 2節には無い）
+- **AVRCP**: 決定（2026-10-03、ユーザー）。TX は AVRCP を扱わない（メタデータが無いことは RX で対処している）。software.md 1節の更新はユーザーの確認の後
+- `TX_RESTART_DELAY_MS`（300ms。TX には M5Dial が無いので、待つ理由は RX ほど無い）
+- 接続から音声の開始まで最大約10秒（ライブラリのハートビート）を、そのままにするか
+- 相手が急にいなくなると、切断の通知までの約5秒に TX の空きヒープが約 11KB まで減る。I2S（S/PDIF）の受信バッファ・48→44.1kHz の変換のメモリは、この減り方を見込んだ大きさにする（減る量が空きに比例するのか一定なのかは未確認）。RX の空きヒープは、TX が急にいなくなっても減らなかった（4-2 で 21.7KB のまま）
+
+atom_a2dp に移すときの作業（共通のファイルを変えるので、atom_a2dp_instructions.md 3節のとおり RX のビルドと起動も確かめる）:
+
+- `tx_main.*`・`tx_audio.*` を `atom_a2dp/` に足し、`atom_a2dp.ino` の `TODO(TX)` を `txSetup()`／`txLoop()` にする
+- `config.h`: `ROLE` の既定は `ROLE_AUTO` のまま。`BT_DEVICE_NAME` を RX の節から共通の節に移す。TX の節に `BT_TX_LOCAL_NAME`・`TX_*`・`TONE_*` を足す（`TONE_*` はダミー信号の間だけ）
+- `status_led.*`: `LED_RED_BLINK` を足す（`ledUpdate()` で赤の点滅も扱う）。`LED_RED` の意味は「TX と判定した（未実装）」から「接続中かつエラー」に変わる
+- `dial_link.*`: atom_a2dp のものをそのまま使う（このスケッチの最小版は使わない）。TX は `dialBegin(false)` で Serial1 を開かない
+- ダミー信号を S/PDIF（I2S）の入力に置き換える位置: `tx_audio.cpp` の `onFrames()`（BT タスクから要求されたフレーム数を埋める。1回 128 フレーム）
+
+## 結果
+
+### 段階0: 準備（2026-10-03）
+
+- 環境は dev-env.md の確認済みのバージョンと同じ（上の表）
+- ESP32-A2DP・M5Unified のソースで確かめたこと: `tx_audio.cpp` 先頭のコメント。M5Unified は ATOM Lite の BtnA を G39 から読む（`M5Unified.inl` の `update()`、`~GPIO.in1` の bit7）
+
+### 段階1: ビルド（2026-10-03）
+
+| 項目 | 値 |
+|---|---|
+| 警告 | なし（`--warnings all` でもこのスケッチのファイルに警告なし） |
+| フラッシュ | 1,268,311 B（40%） |
+| グローバル変数 | 47,256 B（RX の A1 は 48,256 B） |
+| `-DTONE_USE_SINF=1 -DTONE_MODE=1 -DTONE_CHANNEL=1` | ビルドできる（グローバル変数 45,192 B。テーブルの分が減る） |
+
+### 段階2: TX 単体（2026-10-03）
+
+新しい AtomLite（COM7）。`erase_flash` はしていない（新品のため NVS に接続先は無い）。RX の電源は切った。ログは `logs/stage2_tx.txt`・`logs/stage2_tx_fix.txt`。
+
+| 項目 | 結果 |
+|---|---|
+| 起動 | `role=TX (fixed)`。`saved peer none (scan by name)`（名前でのスキャンの経路） |
+| LED | 青のゆっくり点滅（目視） |
+| 掃引 | 100 → … → 12500Hz → 100Hz を 3.00 秒ごと |
+| 1秒ごとのログ | `DISCONNECTED`、フレーム 0/s（未接続では要求が来ない） |
+| 空きヒープ（未接続） | 約 120〜124KB（最小 116〜120KB） |
+| 短押し | 赤の点滅 ⇔ 青の点滅（目視）、`simulated error: ON/OFF` |
+| 3秒長押し | LED が消えて再起動（`SW_CPU_RESET`）→ 青の点滅（目視） |
+
+- 修正: 長押しで再起動した後もボタンを押し続けると、起動後に離したときに短押しと判定され、模擬エラーが ON（赤）になった。起動時（`txSetup()`）に G39 が L なら、最初に離したときを無視するようにした（`button held at boot: ignore the first release`）。修正後、押し続けて離しても青のまま、その後の短押しはいつもどおり（目視・ログ）
+- 起動後も押し続けると、その押下がまた3秒の長押しと判定され、約3.5秒ごとに再起動を繰り返す。このままにする（ユーザーの判断）
+
+### 段階3: RX につなぐ（2026-10-03）
+
+RX は `atom_a2dp`（RX、COM6）、M5Dial は `dial_gui`（COM5。アンプの制御）。スマホ・PC は RX に接続していない。ログは `logs/stage2_tx_fix.txt`（最初の接続）、`logs/stage3_tx.txt`・`logs/stage3_rx.txt`（計測）。
+
+最初の接続（TX を先に起動、RX は後から電源を入れた。名前でのスキャン）:
+
+| 項目 | 結果 |
+|---|---|
+| 接続 | 20:55:25 `connected: C8:85:41:4E:47:6A`（TX の `start()` から 135 秒。RX の電源が切れていた間もスキャンを続けた） |
+| 音声の開始 | 接続の約6秒後に `audio state: STARTED` |
+| ピア名 | RX 側に `fermata SPDIF`（M5Dial で目視、RX のログの `@CONNECTED{"C8:85:41:4C:B8:7E","fermata SPDIF"}`） |
+| 耳 | 8つの周波数のうち 7つが聞こえた。100Hz はスピーカーの再生の下限で聞こえない（送信側の問題ではない） |
+
+計測（21:05:17〜21:11:48、約6.5分。RX の再起動の後の再接続から。下の「COM6 を開いたときの RX のリセット」）:
+
+| 項目 | RX | TX |
+|---|---|---|
+| 受信量／送信フレーム | 平均 176,400 B/s（174,417〜180,224） | 平均 44,101 フレーム/s（43,648〜45,056） |
+| 間隔 | PCM の間隔の最大 39ms（中央値 31ms）、>50ms 0回 | コールバックは1回 128 フレーム、1秒に約 341〜352 回 |
+| リングバッファ | 10,240〜19,616 B、PREFETCH／DROP 0 | — |
+| 処理 | DSP 最大 1,253µs、I2S 書き込み最大 6.3ms | コールバックの処理時間 最大 88µs（ふだん 27µs。128 フレーム＝2.9ms に対して約1〜3%） |
+| 空きヒープ | 接続中 約 20〜22KB（起動からの最小値 15.2KB） | 接続中 112KB（最小値 103KB） |
+
+- 模擬エラー（接続中）: 短押しで赤の点灯 ⇔ 青の点灯（目視、ログ 2往復）
+- 耳: 約5分、途切れ・ノイズ・クリックなし（ユーザーの確認。音が出ないと思ったのは M5Dial の音量を下げたままだったため）
+- 正弦波はテーブル方式で十分軽いので、`TONE_USE_SINF=1` との比較はしていない
+
+COM6 を開いたときの RX のリセット（21:04:48）: `serial_log.ps1`（DTR・RTS 無効）で RX の COM6 を開いたところ、RX が `POWERON_RESET` で再起動した。結果として段階4の「RX の再起動」の流れになった:
+
+| 時刻 | 出来事 |
+|---|---|
+| 21:04:48.8 | RX がリセット |
+| 21:04:49.4 | TX は `CONNECTED, STARTED` のまま、フレーム 0/s、**空きヒープが 112KB → 11.2KB** |
+| 21:04:53.7 | TX が切断を検知（RX のリセットから約5秒）→ 300ms 後に再起動 |
+| 21:04:55.0 | TX が起動。`saved peer C8:85:41:4E:47:6A`（保存したアドレスへ直接接続する経路） |
+| 21:05:06.2 | 接続（TX の `start()` から 11.7 秒。この間 RX は起動中）。RX 側に `@CONNECTED{…,"fermata SPDIF"}` |
+| 21:05:15.5 | 音声の開始（接続の約9秒後） |
+
+### 段階4: 切断・再接続・起動順序（2026-10-03）
+
+ログは `logs/stage3_tx.txt`・`logs/stage3_rx.txt`。2回目以降の接続は、すべて保存したアドレス（`saved peer C8:85:41:4E:47:6A`）への直接接続。
+
+| 操作 | 切断の検知 | 再接続（TX の `start()` から） | 音声の開始（接続から） | 結果 |
+|---|---|---|---|---|
+| TX を先に起動 → RX の電源を入れる（段階3の最初。名前でのスキャン） | — | 135 秒（RX の電源が切れていた時間を含む） | 約6秒 | OK |
+| RX のリセット（COM6 を開いたとき。段階3） | TX: 約5秒後 | 11.7 秒（RX の起動を含む） | 約9秒 | OK。TX の空きヒープが 11.2KB まで減った |
+| 4-1: RX に `!dial KILL`（USB） | TX: 約 30ms 後。RX も `@DISCONNECTED` の 300ms 後に再起動 | 10.8 秒 | 約10秒 | OK。ポップノイズなし。空きヒープは減らない |
+| 4-2: TX の長押しで再起動（RX は起動したまま） | RX: 約5秒後に `@DISCONNECTED` → 再起動 | 12.0 秒 | 約9秒 | OK。長押しから音が戻るまで約21秒 |
+| 4-3: RX の USB を抜き、約20秒後に挿す | TX: 約5秒後 | 21.4 秒（RX の電源が切れていた時間を含む） | 約10秒 | OK。TX の空きヒープが 11.3KB まで減った（再現） |
+
+- 接続から音声の開始（STARTED）まで6〜10秒かかる。ESP32-A2DP の Source は、10秒周期のハートビート（`BluetoothA2DPSource.cpp` の `connTmr`）のたびに `ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY` を送って送出の準備を確かめ、そこで送出を始めるため
+- 相手が急にいなくなったとき（RX のリセット・電源断）は、切断が通知されるまで約5秒かかり、その間 TX の空きヒープが約 11KB まで減る。2回とも同じ。TX が自分から切ったとき（長押し）と、RX が `disconnect()` で切ったとき（KILL）は減らない
+- RX の USB の抜き差し（電源断による再起動）は 4-3 で確認した
+
+### 段階5: 連続動作（2026-10-03）
+
+掃引の高い音（6300Hz・12500Hz）がうるさいので、440Hz に固定して行った（`--build-property "compiler.cpp.extra_flags=-DTONE_MODE=1 -DTONE_FIXED_HZ=440"`。config.h は変えていない）。ログは `logs/stage5_tx.txt`・`logs/stage5_rx.txt`。21:22:08 の音声の開始から計測。
+
+21:22:10〜21:52:44（約30.5分）:
+
+| 項目 | RX | TX |
+|---|---|---|
+| 切断・再起動 | なし | なし |
+| 受信量／送信フレーム | 平均 176,400 B/s（174,417〜180,224） | 平均 44,100 フレーム/s（43,648〜45,056） |
+| 間隔 | PCM の間隔の最大 39ms（中央値 31ms）、>50ms 0回 | — |
+| リングバッファ | 10,560〜20,736 B、PREFETCH／DROP 0 | — |
+| 処理 | DSP 最大 1,253µs、I2S 書き込み最大 6.1ms | コールバック ふだん 23〜24µs。最大 438µs は音声の開始の直後の1回だけ |
+| 空きヒープ | 接続中 20.0〜21.5KB で一定。最小値 15.0KB（起動直後の値のまま変わらない） | 接続中 112,212 B で一定。最小値 103,304 B（変わらない） |
+
+- 空きヒープは 21:23・21:30・21:40・21:50 で同じ値。減っていく傾向はない
+- 耳: 異常なし（ユーザーの確認）。小さなブツブツというノイズがあるが、M5Dial でミュートしても残る。RX の試験のときにもあったので、評価用のジャンパ配線の影響と考えられる（ユーザーの判断。TX の試験の対象外）。気になるほどのプツッという音はない
+- 試験の後の TX（COM7）には、この 440Hz 固定のビルドが書き込まれたまま
+
+### 段階6: まとめ（2026-10-03）
+
+完了の条件（段階3〜5の合格条件を実機で確認）を満たした:
+
+| 段階 | 結果 |
+|---|---|
+| 3 | 接続、ピア名 `fermata SPDIF`、176,400 B/s、>50ms 0回、リングバッファは空にならない、模擬エラーの赤の点灯、耳で5分異常なし |
+| 4 | 両方の起動順序、RX の再起動・電源断、`!dial KILL`、TX のリセットで、すべて再接続した。2回目以降は保存したアドレスへの直接接続（TX の `start()` から 11〜12 秒、RX の起動を含む） |
+| 5 | 30分、切断・再起動なし、空きヒープは一定、音の異常なし |
+
+測れなかったこと: 名前でのスキャン（初回）にかかる時間。初回の接続（135 秒）は RX の電源が切れていた時間を含むので、純粋なスキャンの時間ではない。測るには `erase_flash`（または NVS の消去）をして、RX を起動した状態で TX を起動する
+
+## 追加: I2S 受信と S/PDIF の状態の通知（2026-10-03〜）
+
+段階6の後に、ユーザーの指示で足した。I2S の接続相手（AE-DIR8416 と S/PDIF の送信機器）がまだ無いので、I2S はビルドまで。モックアップでは、S/PDIF の状態の通知を先に確かめる。
+
+### 音源（`TX_AUDIO_SOURCE`）
+
+| 値 | 内容 | グローバル変数 |
+|---|---|---|
+| 0（既定） | 正弦波（これまでの試験と同じ） | 47,280 B |
+| 1 | I2S のスレーブ受信（`tx_spdif.cpp`。ESP-IDF の `i2s_std`、G22・G19・G23、32bit スロット）→ 48k→44.1k の変換 → リングバッファ → BT | 64,536 B |
+| 2 | 変換の試験（内部で 48kHz×(1+`TX_SRC_TEST_PPM`) の正弦波を作り、I2S の代わりに変換に通す） | 63,616 B |
+
+- エラー: `i2s_channel_read()` が `TX_I2S_TIMEOUT_MS`（20ms）データを返さない、または RERR（`TX_USE_RERR=1` のとき）が H。エラー中は受信データを捨て、BT には無音を渡す。正常が `TX_RECOVER_MS`（200ms）続いたら I2S を止めて再開してから送出を戻す（software.md 2.2節）
+- 変換: 窓付き sinc の多相 FIR（32 タップ × 64 相、相の間は線形補間、float、遮断 約 20.5kHz、Kaiser β=6）。比率は、リングバッファの量が目標（`TX_RING_TARGET_MS` 25ms）になるように ±2000ppm の範囲で調整する（クロックのずれの吸収）
+- リングバッファ: 2048 フレーム（8KB）。書き込みは受信タスク（コア1）、読み出しは BT タスクの単独所有。空にするのは読み出し側（impl-notes.md 1.2節）。足りなくなったら目標の量まで貯め直す
+- エラー中（模擬エラーを含む）は無音を送る（`TX_MUTE_ON_ERROR=1`）。LED・通知は S/PDIF のエラーと模擬エラーをまとめて扱う
+- 未確認: 変換の試験（モード2）、I2S の実機（OI-01〜05、OI-24、OI-31）
+
+### S/PDIF の状態を RX に知らせる（`TX_AVRCP_STATUS`）
+
+ユーザーの案は「正常時は `S/PDIF PLAYING`、エラー時は `S/PDIF ERROR` を曲名として送る」。ESP-IDF の AVRCP Target では送れなかったので、パススルーで送る形にした（ユーザーの了承済み）。詳細と RX の変更の内容は [rx_change_request.md](rx_change_request.md)。
+
+| 方法 | 結果（2026-10-03） |
+|---|---|
+| 曲名（`GetElementAttributes` に答える） | ESP-IDF の Target に API が無い |
+| 再生状態の通知（`PLAY_STATUS_CHANGE`） | Target が許す通知は `VOLUME_CHANGE` だけ（`allowed 0x2000`、`supported 0x0000`）。RX は登録しに来ない（`logs/avrcp_tx2.txt`） |
+| パススルー（PLAY=正常／STOP=エラー） | TX から送れる。RX の応答は NOT_IMPL（RX のライブラリが受け付けるパススルーを設定していないため）。RX を変えて ACCEPT になった（`logs/avrcp_psth.txt`） |
+
+- RX の変更（ユーザーの指示で、この作業の中で `BT_SPEAKER/atom_a2dp` を変えて書き込んだ。コミットはしていない）: [rx_change_request.md](rx_change_request.md) の0節
+- 結果: M5Dial の曲名が `S/PDIF PLAYING` ⇔ `S/PDIF ERROR`（模擬エラーの短押し）。PC・iPhone との接続では今までどおりのメタ情報。SLEEP からのウェイクの後も出る（ユーザーの確認。`logs/avrcp_rx.txt`）。この方式で行く（ユーザーの判断）
+- RX はピア名が `fermata SPDIF` のときだけ状態を曲名にする
+- 試験の後の TX（COM7）には、正弦波 440Hz 固定＋パススルーの版が書き込まれている
+
+### S/PDIF が途絶えたときの検出と、BT 接続をしないこと（2026-10-04）
+
+ユーザーの要望: 大元の電源（S/PDIF の送信側）が切れているときは、TX から BT 接続せず、スマホ等が RX につなげるようにする。
+
+CS8416 の信号断のときの動き（データシート DS578F3 8.2節・表2・10.1.2節。Cirrus Logic の公開 PDF で確認。実機は未確認 [OI-03]）:
+
+- PLL がアンロックすると、VCO が約 750kHz に下がり、出力クロックはそこから作られて**出続ける**（OLRCK 約 2.925kHz、OSCLK 約 187.5kHz）。OMCK ピンに起動後クロックが入ると「クロックの切り替え」が有効になり、アンロック中は OMCK から作る（OLRCK = OMCK/256）。キットの OMCK の配線は回路図（`_MAKE/ae-dir8416.pdf`）では読み切れない
+- エラーの間、SDOUT は直前のサンプルを保つ
+- NV/RERR はハードウェアモードで起動時のプル（47kΩ で VL: RERR、DGND: NVERR）で決まり、**どちらも PLL のロックのエラーで H**（違いは Validity ビットを含むか）。キットの回路図では R14（47kΩ）が AGND 側に見え、NVERR と思われる [OI-02]。信号断の検出には NVERR でも足りる
+
+検出（`tx_spdif.cpp`）:
+
+| 方法 | 内容 |
+|---|---|
+| 受信タイムアウト | 20ms（`TX_I2S_TIMEOUT_MS`）。2.925kHz では 96 フレームに約 33ms かかるので検出できるが、ブロックの大きさ次第 |
+| **受信レートの監視（追加）** | 500ms（`TX_RATE_WINDOW_MS`）ごとに LRCK の周波数を測り、48kHz から ±3%（`TX_RATE_TOL_PCT`）を外れたらエラー（`rate`）。ブロックの大きさに関係なく、クロックの切り替えが有効な場合（OMCK/256）も検出できる。復帰の条件にも、レートを1回以上測って正しいことを足した |
+| RERR／NVERR | `TX_USE_RERR=1`（配線の後） |
+
+BT 接続をしない（`tx_main.cpp` の `btGate()`、`TX_BT_NEED_SPDIF=1`）:
+
+- 起動後、S/PDIF の正常が 1 秒（`TX_BT_START_OK_MS`）続くまで A2DP の `start()` を呼ばない（BT は動かさない。LED は赤の点滅）
+- 始めた後にエラーが 30 秒（`TX_BT_STOP_ERR_MS`）続いたら `ESP.restart()` して待ちに戻る（`start()` の呼び直しはしない）。RX は TX の切断で再起動し、スマホ等がつなげるようになる
+- 短いエラー（入力の切り替え等）は、今までどおり無音と `S/PDIF ERROR` の表示だけ
+- スマホが RX を使っている間に S/PDIF が戻ったら、TX は接続を試し続け、スマホが切れたらつなぐ（先につないだ方が使う。ユーザーの判断）
+- 模擬エラーは、ソフトウェアの再起動（`ESP.restart()`）をまたいで覚える（`RTC_NOINIT_ATTR`。S/PDIF が途絶えたまま再起動した状態の模擬）。電源投入・長押しの再起動では消す
+- 待ち時間（1 秒・30 秒）はまず推奨値（ユーザーの判断）。TX の電源はテレビの USB・別のアダプタのどちらもあり得る（OI-04）
+
+モックアップでの確認（2026-10-04、`logs/btgate_tx.txt`・`btgate_rx.txt`。ユーザーの確認: 1〜4 すべて OK）:
+
+| 時刻 | 出来事 |
+|---|---|
+| 00:03:20.1 | 模擬エラー ON → パススルー STOP（ACCEPT）→ RX の曲名 `S/PDIF ERROR` |
+| 00:03:50.1 | 30 秒後に TX が再起動 → `simulated error: ON (kept over restart)`、BT を始めずに待つ |
+| 00:03:55.1 | RX が切断を検知（約5秒後）→ 再起動 |
+| 00:04:11.9 | iPhone が RX に接続（再生できた） |
+| 00:04:29.2 | 模擬エラー OFF → 00:04:30.2 に `start A2DP`（iPhone の接続中は RX につなげない） |
+| 00:04:43.9 | iPhone を切断 → RX が再起動 |
+| 00:04:51.5 | TX が接続 → 00:04:52.6 にパススルー PLAY → RX の曲名 `S/PDIF PLAYING` |
+| 00:05:09.7 | 長押しで再起動（模擬エラーの記憶を消す）→ 1 秒後に `start A2DP` → 00:05:22.1 に接続 |
+
+## 分かったこと・落とし穴
+
+（BT_SPEAKER の impl-notes.md に反映する候補。反映はユーザーの確認の後）
+
+- **長押しで再起動したときのボタン**（模擬エラーは確認のときだけの機能なので、製品では気にしない）: 再起動の後もボタンが押されたままだと、M5Unified は起動後の最初の `update()` でそれを新しい押下として扱い、離したときに `wasReleased()` が true になる。短押しに機能を割り当てるときは、起動時にボタンが押されていたら最初に離したときを無視する（`tx_main.cpp`）。押し続けた時間も起動から数え直されるので、長押しの判定も再びかかる
+- **Source は未接続の間、データのコールバックを呼ばない**: 1秒あたりのフレーム数は 0（`frames 0/s`）
+- **Source のデータの要求**: 1回 128 フレーム（約 2.9ms）ずつ、1秒に約 345 回。合計は 44,100 フレーム/s に合う
+- **相手が突然いなくなると、切断が通知されるまでの約5秒、Source の空きヒープが大きく減る**: RX がリセットされたとき、TX は `CONNECTED` のままフレームの要求が止まり、空きヒープが 112KB → 11.2KB になった（送れないデータが BT スタックに溜まると考えられる）。切断の通知の後は再起動するので問題は出なかった。TX に I2S（S/PDIF）の受信バッファを足すときは、この減り方を見込む（RX では約5KB で BT が止まった前例。impl-notes.md 1.6節）
+- **接続から音が出るまで最大約10秒**: Source は10秒周期のハートビートで送出の準備を確かめてから送出を始める（段階4）。短くしたい場合は、接続を検知したときに送出を始める方法を合体のときに検討する
+- **ESP-IDF の AVRCP Target の制約**: 曲名などの要求（`GetElementAttributes`）に答える API が無い。通知は `VOLUME_CHANGE` だけが許される（`esp_avrc_tg_get_rn_evt_cap(ALLOWED)` が `0x2000`）。ESP32 の Source から RX へ状態を伝えるには、Controller からのパススルーを使う
+- **Sink（ESP32-A2DP 1.8.11）はパススルーを受け付ける設定をしない**: Target は初期化するが、`esp_avrc_tg_set_psth_cmd_filter(SUPPORTED)` を呼ばないので、送られたパススルーには NOT_IMPL が返る
+- **CS8416 は信号断でもクロックを止めない**: OLRCK が約 2.925kHz で出続ける（データシート）。I2S の受信タイムアウトだけに頼らず、受信レート（LRCK の周波数）と RERR／NVERR で検出する。NVERR の設定でも PLL のロックのエラーで H になる
+- **RX の COM ポートを開くと RX がリセットされることがある**: DTR・RTS を無効にしていても、COM6 を開いたときに `POWERON_RESET` になった（atom_a2dp_instructions.md 4節の注意のとおり）。RX のログは、計測を始める前に開いておく（デバッグのときだけのことなので、impl-notes には反映しない。ユーザーの判断）
