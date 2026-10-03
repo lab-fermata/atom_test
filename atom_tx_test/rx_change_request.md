@@ -2,7 +2,7 @@
 
 作成: 2026-10-03（atom_tx_test の作業から。Claude Code）
 対象: `BT_SPEAKER/atom_a2dp/rx_audio.cpp`（c1d9300）。M5Dial（dial_gui）は変えない見込み
-状態: **実装・確認済み**（2026-10-03。ユーザーの指示で、atom_tx_test の作業の中で RX を変更して書き込み、TX とともに確かめた。BT_SPEAKER へのコミットはしていない）
+状態: **実装・確認済み**（2026-10-03。ユーザーの指示で、atom_tx_test の作業の中で RX を変更して書き込み、TX とともに確かめた。BT_SPEAKER の a0e7361（rx-integration ブランチ）でコミットした）
 
 ## 0. 結果（2026-10-03）
 

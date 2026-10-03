@@ -228,7 +228,7 @@ COM6 を開いたときの RX のリセット（21:04:48）: `serial_log.ps1`（
 | 再生状態の通知（`PLAY_STATUS_CHANGE`） | Target が許す通知は `VOLUME_CHANGE` だけ（`allowed 0x2000`、`supported 0x0000`）。RX は登録しに来ない（`logs/avrcp_tx2.txt`） |
 | パススルー（PLAY=正常／STOP=エラー） | TX から送れる。RX の応答は NOT_IMPL（RX のライブラリが受け付けるパススルーを設定していないため）。RX を変えて ACCEPT になった（`logs/avrcp_psth.txt`） |
 
-- RX の変更（ユーザーの指示で、この作業の中で `BT_SPEAKER/atom_a2dp` を変えて書き込んだ。コミットはしていない）: [rx_change_request.md](rx_change_request.md) の0節
+- RX の変更（ユーザーの指示で、この作業の中で `BT_SPEAKER/atom_a2dp` を変えて書き込んだ。BT_SPEAKER a0e7361）: [rx_change_request.md](rx_change_request.md) の0節
 - 結果: M5Dial の曲名が `S/PDIF PLAYING` ⇔ `S/PDIF ERROR`（模擬エラーの短押し）。PC・iPhone との接続では今までどおりのメタ情報。SLEEP からのウェイクの後も出る（ユーザーの確認。`logs/avrcp_rx.txt`）。この方式で行く（ユーザーの判断）
 - RX はピア名が `fermata SPDIF` のときだけ状態を曲名にする
 - 試験の後の TX（COM7）には、正弦波 440Hz 固定＋パススルーの版が書き込まれている
