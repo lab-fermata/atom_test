@@ -191,12 +191,26 @@
 #ifndef TX_RING_TARGET_MS
 #define TX_RING_TARGET_MS 25
 #endif
+// 送出の開始・足りなくなった後は、この量（ms）まで貯めてから BT に渡す（開始の直後に BT が多めに読むため）
+#ifndef TX_RING_PRIME_MS
+#define TX_RING_PRIME_MS 30
+#endif
 // 比率の調整の上限（ppm）と強さ（目標からのずれ 100% あたりの ppm）
 #ifndef TX_SRC_ADJ_MAX_PPM
 #define TX_SRC_ADJ_MAX_PPM 2000
 #endif
+// 比例の強さ: 5000ppm で、量のずれを約 5 秒（目標の量 ÷ (44.1 フレーム/秒 × 5)）で戻す
 #ifndef TX_SRC_ADJ_GAIN_PPM
-#define TX_SRC_ADJ_GAIN_PPM 1000
+#define TX_SRC_ADJ_GAIN_PPM 5000
+#endif
+// 比率の調整の積分の時定数（秒）。クロックのずれの分を積分で吸収し、リングバッファの量を目標に戻す。
+// 比例で戻る時間（約 5 秒）より十分長くして、行き過ぎ・揺れを防ぐ（10 秒・比例 1000ppm では約 100 秒周期で揺れた）
+#ifndef TX_SRC_ADJ_TI_S
+#define TX_SRC_ADJ_TI_S 30
+#endif
+// リングバッファの量の平滑化の時定数（ms）。BT は数十 ms ごとにまとめて読むので、量が 25ms 分ほど上下する
+#ifndef TX_SRC_FILL_TAU_MS
+#define TX_SRC_FILL_TAU_MS 500
 #endif
 
 // ---- AVRCP（S/PDIF の状態を RX に知らせる）----

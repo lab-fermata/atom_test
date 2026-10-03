@@ -39,6 +39,8 @@ static constexpr uint32_t kRingCap = TX_RING_FRAMES;
 static_assert((kRingCap & (kRingCap - 1)) == 0, "TX_RING_FRAMES must be a power of 2");
 static constexpr uint32_t kRingTarget = (uint32_t)kOutRate * TX_RING_TARGET_MS / 1000;
 static_assert(kRingTarget < kRingCap, "TX_RING_TARGET_MS is too large for TX_RING_FRAMES");
+static constexpr uint32_t kRingPrime = (uint32_t)kOutRate * TX_RING_PRIME_MS / 1000;
+static_assert(kRingPrime >= kRingTarget && kRingPrime < kRingCap, "TX_RING_PRIME_MS must be >= TX_RING_TARGET_MS");
 
 // ---- リングバッファ（44.1kHz・16bit・2ch）----
 static int16_t s_ring[kRingCap * 2];
@@ -46,6 +48,7 @@ static std::atomic<uint32_t> s_head{0};        // 書き込み位置（受信タ
 static std::atomic<uint32_t> s_tail{0};        // 読み出し位置（BT タスクだけが進める）
 static std::atomic<bool> s_resetReq{true};     // 受信タスク → BT タスク: 空にして、目標の量まで貯め直す
 static bool s_priming = true;                  // BT タスクだけが使う: 目標の量まで貯める間は無音を渡す
+static std::atomic<uint32_t> s_lastReadMs{0};  // BT が最後にデータを要求した時刻（ms）
 
 // ---- 状態・計測 ----
 enum ErrReason : int { ERR_NONE = 0, ERR_TIMEOUT, ERR_RERR, ERR_RATE };
@@ -73,6 +76,7 @@ static int s_inCount = 0;                      // s_in のフレーム数
 static double s_pos = 0;                       // 次に作る出力の位置（s_in の先頭からの入力サンプル数）
 static double s_stepNominal = 1.0;             // 入力のレート／出力のレート
 static float s_fillAvg = 0;
+static float s_adjInt = 0;                     // 比率の調整の積分の項（ppm）
 
 static double besselI0(double x) {
   double sum = 1, term = 1;
@@ -129,9 +133,27 @@ static void convert(const float* in, int n) {
   // 比率の調整: リングバッファの量（平滑化）が目標より多ければ入力を速く進める（出力を減らす）
   uint32_t head = s_head.load(std::memory_order_relaxed);
   uint32_t fill = head - s_tail.load(std::memory_order_acquire);
-  s_fillAvg += 0.05f * ((float)fill - s_fillAvg);
+  // BT が読んでいない間（接続前など）は、変換の計算を省いて入力の位置だけ進め、空にする要求を出し続ける
+  // （古いデータを貯めない。読み始めたら、新しいデータで目標の量まで貯めてから渡す）。比率の調整も止める
+  bool reading = (uint32_t)(esp_timer_get_time() / 1000) - s_lastReadMs.load(std::memory_order_relaxed) < 50;
+  if (!reading) {
+    s_resetReq.store(true, std::memory_order_release);
+    s_fillAvg = kRingTarget;
+    const double step = s_stepNominal * (1.0 + s_adjInt * 1e-6);
+    while ((int)s_pos + kTaps <= s_inCount) s_pos += step;
+  }
+  s_fillAvg += ((float)n / TX_IN_RATE * 1000.0f / TX_SRC_FILL_TAU_MS) * ((float)fill - s_fillAvg);
   float err = (s_fillAvg - kRingTarget) / kRingTarget;
-  float adj = err * TX_SRC_ADJ_GAIN_PPM;
+  // PI: 比例だけだとクロックのずれの分だけ量が目標からずれたままになる（+200ppm で容量の近くまで増えた）ので、
+  // 積分（時定数 TX_SRC_ADJ_TI_S 秒）でずれを吸収し、量を目標に戻す。準備中（目標の量まで貯める間）は積分しない
+  // （積分の値はクロックのずれとして残す）
+  float p = err * TX_SRC_ADJ_GAIN_PPM;
+  if (reading && !s_resetReq.load(std::memory_order_relaxed)) {
+    s_adjInt += p * ((float)n / TX_IN_RATE / TX_SRC_ADJ_TI_S);
+    if (s_adjInt > TX_SRC_ADJ_MAX_PPM) s_adjInt = TX_SRC_ADJ_MAX_PPM;
+    if (s_adjInt < -TX_SRC_ADJ_MAX_PPM) s_adjInt = -TX_SRC_ADJ_MAX_PPM;
+  }
+  float adj = p + s_adjInt;
   if (adj > TX_SRC_ADJ_MAX_PPM) adj = TX_SRC_ADJ_MAX_PPM;
   if (adj < -TX_SRC_ADJ_MAX_PPM) adj = -TX_SRC_ADJ_MAX_PPM;
   s_adjPpm.store((int32_t)lrintf(adj), std::memory_order_relaxed);
@@ -346,6 +368,7 @@ void spdifBegin() {
 
 // BT タスクで呼ばれる。len フレームを必ず埋める
 int32_t spdifRead(Frame* data, int32_t len) {
+  s_lastReadMs.store((uint32_t)(esp_timer_get_time() / 1000), std::memory_order_relaxed);  // BT が読んでいる
   if (s_resetReq.exchange(false, std::memory_order_acquire)) {
     s_tail.store(s_head.load(std::memory_order_acquire), std::memory_order_release);
     s_priming = true;
@@ -353,7 +376,9 @@ int32_t spdifRead(Frame* data, int32_t len) {
   uint32_t tail = s_tail.load(std::memory_order_relaxed);
   uint32_t avail = s_head.load(std::memory_order_acquire) - tail;
   bool err = s_err.load(std::memory_order_relaxed) != ERR_NONE;
-  if (s_priming && !err && avail >= kRingTarget) s_priming = false;
+  // 貯め直すときは目標より多め（TX_RING_PRIME_MS）まで貯める（音声の開始の直後に BT が多めに読み、目標の量では
+  // 1回足りなくなった。多い分は比率の調整で目標に戻る）
+  if (s_priming && !err && avail >= kRingPrime) s_priming = false;
   if (s_priming || err) {
     memset(data, 0, sizeof(Frame) * len);
     return len;
