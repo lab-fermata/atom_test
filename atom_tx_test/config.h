@@ -60,8 +60,6 @@
 // TX
 // ================================================================
 
-#define PIN_RERR      33  // ← CS8416 RERR（内部プル禁止）。atom_tx_test では使わない
-
 // 自分の BT 名（RX の @CONNECTED に出るピア名）
 #ifndef BT_TX_LOCAL_NAME
 #define BT_TX_LOCAL_NAME "fermata SPDIF"
@@ -139,10 +137,6 @@
 #ifndef TX_I2S_TIMEOUT_MS
 #define TX_I2S_TIMEOUT_MS 20
 #endif
-// 1: RERR（G33。H でエラー）を読む。0: 読まない（G33 が開放のとき。内部プルは使えないので値が定まらない）
-#ifndef TX_USE_RERR
-#define TX_USE_RERR 0
-#endif
 // エラーが消えてから、これだけ正常が続いたら I2S を止めて再開し、送出を再開する（ms）
 #ifndef TX_RECOVER_MS
 #define TX_RECOVER_MS 200
@@ -156,11 +150,31 @@
 #define TX_RATE_TOL_PCT 3
 #endif
 
+// ---- BT 接続を始める時機（ユーザーの判断、2026-10-06）----
+// - 普段の起動（電源投入・長押しの再起動）: S/PDIF を待たずにすぐ A2DP を始める。S/PDIF から音が取れるまでは無音を送る
+// - 切断で再起動したとき: 起動から TX_RECONNECT_HOLD_MS は始めない（RX が切ったときに、少なくとも 10 秒はスマホ等が
+//   RX につなげるように。RX の電源断なども同じ扱い）。ESP32-A2DP 1.8.11 は start() の中で、最初の接続を試みる前に
+//   決め打ちで 10 秒待つ（BluetoothA2DPSource.cpp の av_hdl_stack_evt の delay_ms(10000)）ので、0 でも切断から
+//   接続までは約 11 秒空く（ユーザーの判断で 0。2026-10-06）
+// - 「S/PDIF が TX_BT_STOP_ERR_MS 無い」で再起動したとき: S/PDIF の正常が TX_BT_START_OK_MS 続くまで始めない
+//   （大元の電源が切れているとき、スマホ等が RX につなげるように）。どの再起動かは RTC のメモリで覚える
+#ifndef TX_RECONNECT_HOLD_MS
+#define TX_RECONNECT_HOLD_MS 0
+#endif
+// 接続してから、送出の準備の確認（ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY）をこちらから送るまでの待ち（ms）と、
+// 送出が始まらないときに送り直す間隔（ms）。0: 送らない（ライブラリの 10 秒周期のハートビートを待つ）
+#ifndef TX_MEDIA_KICK_MS
+#define TX_MEDIA_KICK_MS 300
+#endif
+#ifndef TX_MEDIA_KICK_RETRY_MS
+#define TX_MEDIA_KICK_RETRY_MS 2000
+#endif
+
 // ---- S/PDIF が無いときは BT 接続しない（大元の電源が切れているとき、スマホ等が RX につなげるように）----
 
-// 1: 起動後、S/PDIF が正常な状態が TX_BT_START_OK_MS 続くまで A2DP を始めない（start() を呼ばない）。
-//    始めた後にエラー（模擬エラーを含む）が TX_BT_STOP_ERR_MS 続いたら、ESP.restart() して待ちに戻る
-//    （start() の呼び直しはしない。impl-notes.md 1.1節）。0: 起動したらすぐ始め、エラーでも切らない
+// 1: A2DP を始めた後にエラー（模擬エラーを含む）が TX_BT_STOP_ERR_MS 続いたら、ESP.restart() して、S/PDIF の正常が
+//    TX_BT_START_OK_MS 続くまで A2DP を始めない（start() の呼び直しはしない。impl-notes.md 1.1節）。
+//    0: エラーでも切らない
 #ifndef TX_BT_NEED_SPDIF
 #define TX_BT_NEED_SPDIF 1
 #endif

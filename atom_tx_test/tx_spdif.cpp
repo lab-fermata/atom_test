@@ -3,7 +3,7 @@
 // - I2S は ESP-IDF の i2s_std を直接使う（コア 3.3.9 は IDF 5.5。driver/i2s_std.h）。CS8416 がマスタ、ESP32 はスレーブ。
 //   BCK=G22、WS=G19、DIN=G23（hardware.md 4.1節）。フォーマットは I2S（Philips）、スロット幅 TX_I2S_SLOT_BITS [OI-01]
 // - 受信は専用のタスク（コア1）で行う。i2s_channel_read() が TX_I2S_TIMEOUT_MS の間データを返さない、または
-//   RERR（G33）が H なら、エラーとして受信データを捨てる（BT には無音が渡る）。エラーが消えて TX_RECOVER_MS 正常が続いたら、
+//   受信レート（LRCK）が入力のレートから外れていたら、エラーとして受信データを捨てる（BT には無音が渡る）。エラーが消えて TX_RECOVER_MS 正常が続いたら、
 //   I2S を止めて再開してから送出を再開する（software.md 2.2節。L/R の入れ替わり・ビットずれの対策 [OI-05]）
 // - 変換は窓付き sinc の多相 FIR（32 タップ × 64 相、相の間は線形補間、float）。比率は「入力のレート／44.1k」を、
 //   リングバッファの量が目標（TX_RING_TARGET_MS）に保たれるように少しだけ変える（クロックのずれの吸収。software.md 2.1節）
@@ -14,7 +14,6 @@
 #include <math.h>
 #include <esp_timer.h>
 #include <driver/i2s_std.h>
-#include <driver/gpio.h>
 #include "tx_spdif.h"
 #include "config.h"
 #include "dial_link.h"
@@ -51,8 +50,9 @@ static bool s_priming = true;                  // BT タスクだけが使う: �
 static std::atomic<uint32_t> s_lastReadMs{0};  // BT が最後にデータを要求した時刻（ms）
 
 // ---- 状態・計測 ----
-enum ErrReason : int { ERR_NONE = 0, ERR_TIMEOUT, ERR_RERR, ERR_RATE };
-static std::atomic<uint32_t> s_rateHz{0};      // 最後に測った受信レート（Hz）
+enum ErrReason : int { ERR_NONE = 0, ERR_TIMEOUT, ERR_RATE };
+static std::atomic<uint32_t> s_rateHz{0};      // 最後に測った受信レート（Hz。エラー中も測る）
+static std::atomic<uint32_t> s_rawFrames{0};   // 診断用: 受け取ったフレーム数（エラー中も数える。前回のログ以降）
 static std::atomic<int> s_err{ERR_TIMEOUT};    // 起動直後はデータが来るまでエラー扱い
 static std::atomic<uint32_t> s_inFrames{0}, s_outFrames{0}, s_readFrames{0}, s_underruns{0}, s_overruns{0};
 static std::atomic<uint32_t> s_ringMin{UINT32_MAX}, s_ringMax{0}, s_procUsMax{0}, s_restarts{0};
@@ -238,70 +238,67 @@ static bool i2sBegin() {
   return i2s_channel_enable(s_rx) == ESP_OK;
 }
 
-// 受信レートの監視: TX_RATE_WINDOW_MS ごとに、受け取ったフレーム数と時間から LRCK の周波数を求める。
-// CS8416 は PLL がアンロックすると、出力クロックが VCO の待機の周波数（OLRCK 約 2.925kHz）になって出続け、
-// クロックの切り替え（OMCK）が有効なら OMCK/256 になる（CS8416 データシート DS578F3 8.2節・表2）。
-// どちらも TX_IN_RATE から外れるので、受信タイムアウト（ブロックの大きさ次第）に頼らずに検出できる。
+// 受信レートの監視: エラー・時間切れに関係なく、受け取ったフレーム数（時間切れで一部だけ受け取った分も含む）を数え、
+// TX_RATE_WINDOW_MS ごとに LRCK の周波数を求めて、エラーの判定に使う。
+// CS8416 は PLL がアンロックすると、出力クロックが VCO の待機の周波数で出続け（データシートでは OLRCK 約 2.925kHz。
+// AE-DIR8416 の実機・S/PDIF 未接続で約 2.7kHz）、クロックの切り替え（OMCK）が有効なら OMCK/256 になる
+// （CS8416 データシート DS578F3 8.2節・表2）。以前は時間切れのたびに測り直していたので、遅いクロック（96 フレームに
+// 約 35ms かかり、20ms で時間切れ）ではレートが一度も計算されなかった（rate 0 Hz。README の 2026-10-04 の状態確認）。
+// いまは測り直さないので、1 回に読む量に関係なく検出できる。
 // 窓の最初は DMA に溜まった分がすぐ読めるので、窓は長めにする（4×2ms の溜まりで 500ms の窓なら 1.6% 以内）
-static bool s_rateBad = false;     // 最後の窓でレートが外れていた
-static bool s_rateSeen = false;    // エラーの後、レートを1回以上測った
+static bool s_rateBad = false;      // 最後の窓でレートが外れていた
+static bool s_rateNoClock = false;  // 最後の窓でほとんど受け取らなかった（クロックが来ていない）
+static uint32_t s_rateWinSeq = 0;   // 測った窓の数
 static int64_t s_rateT0 = 0;
-static uint32_t s_rateFrames = 0;
+static uint32_t s_rateWin = 0;
 
-static void rateReset() {
-  s_rateT0 = 0;
-  s_rateFrames = 0;
-  s_rateSeen = false;
-}
-
-static void rateUpdate(uint32_t frames) {
+static void rateUpdate(size_t gotBytes) {
+  uint32_t frames = gotBytes / (sizeof(SlotT) * 2);
+  s_rawFrames.fetch_add(frames, std::memory_order_relaxed);  // 診断用（1 秒ごとのログの raw）
   int64_t now = esp_timer_get_time();
   if (s_rateT0 == 0) {
-    s_rateT0 = now;  // 最初のブロックは時間の起点にするだけ
+    s_rateT0 = now;  // 最初の読み出しは時間の起点にするだけ
     return;
   }
-  s_rateFrames += frames;
+  s_rateWin += frames;
   int64_t el = now - s_rateT0;
   if (el < TX_RATE_WINDOW_MS * 1000LL) return;
-  uint32_t hz = (uint32_t)(s_rateFrames * 1000000LL / el);
+  uint32_t hz = (uint32_t)(s_rateWin * 1000000LL / el);
   s_rateHz.store(hz, std::memory_order_relaxed);
   s_rateBad = (uint32_t)abs((int)hz - TX_IN_RATE) > (uint32_t)TX_IN_RATE * TX_RATE_TOL_PCT / 100;
-  s_rateSeen = true;
+  s_rateNoClock = hz < (uint32_t)TX_IN_RATE / 100;
+  s_rateWinSeq++;
   s_rateT0 = now;
-  s_rateFrames = 0;
+  s_rateWin = 0;
 }
 
 static void taskI2s(void*) {
   int okMs = 0;
+  uint32_t errSeq = 0;  // 最後にエラーだったときの窓の数
   for (;;) {
     size_t got = 0;
     esp_err_t e = i2s_channel_read(s_rx, s_rxBuf, sizeof(s_rxBuf), &got, TX_I2S_TIMEOUT_MS);
+    rateUpdate(got);
     int reason = ERR_NONE;
-    if (e != ESP_OK || got < sizeof(s_rxBuf)) {
+    if (s_rateBad) {
+      reason = s_rateNoClock ? ERR_TIMEOUT : ERR_RATE;  // ほとんど来ていなければ timeout、来ているが外れていれば rate
+    } else if (e != ESP_OK || got < sizeof(s_rxBuf)) {
       reason = ERR_TIMEOUT;
-      rateReset();
-    } else {
-      rateUpdate(kBlock);
-      if (s_rateBad) reason = ERR_RATE;
-#if TX_USE_RERR
-      else if (gpio_get_level((gpio_num_t)PIN_RERR)) reason = ERR_RERR;
-#endif
     }
     int cur = s_err.load(std::memory_order_relaxed);
     if (reason != ERR_NONE) {
       okMs = 0;
+      errSeq = s_rateWinSeq;
       if (cur != reason) s_err.store(reason, std::memory_order_relaxed);
       continue;  // 受信データは捨てる（BT には無音が渡る）
     }
     if (cur != ERR_NONE) {
-      // エラーからの復帰: 正常が TX_RECOVER_MS 続き、レートも1回以上測って正しければ、
-      // I2S を止めて再開してから送出を再開する
+      // エラーからの復帰: 正常が TX_RECOVER_MS 続き、最後のエラーの後に丸ごと正常な窓を1つ測って（errSeq+1 の窓は
+      // エラーの間を含むことがあるので errSeq+2）レートが正しければ、I2S を止めて再開してから送出を再開する
       okMs += kBlock * 1000 / TX_IN_RATE;
-      if (okMs < TX_RECOVER_MS || !s_rateSeen) continue;
+      if (okMs < TX_RECOVER_MS || s_rateWinSeq < errSeq + 2) continue;
       i2s_channel_disable(s_rx);
       i2s_channel_enable(s_rx);
-      rateReset();
-      s_rateSeen = true;  // 再開の前に測ったレートは正しかった
       s_restarts.fetch_add(1, std::memory_order_relaxed);
       resetConverter();
       s_err.store(ERR_NONE, std::memory_order_relaxed);
@@ -348,15 +345,9 @@ void spdifBegin() {
   buildCoef();
   resetConverter();
 #if TX_AUDIO_SOURCE == 1
-#if TX_USE_RERR
-  gpio_reset_pin((gpio_num_t)PIN_RERR);  // 入力。内部プルは使わない（hardware.md 4.2節）
-  gpio_set_direction((gpio_num_t)PIN_RERR, GPIO_MODE_INPUT);
-  gpio_set_pull_mode((gpio_num_t)PIN_RERR, GPIO_FLOATING);
-#endif
   bool ok = i2sBegin();
-  LOG1("spdif: I2S slave %s (BCK G%d, WS G%d, DIN G%d, %d Hz, slot %d bit, timeout %d ms, rerr %s)", ok ? "ok" : "FAILED",
-       PIN_I2S_BCK, PIN_I2S_WS, PIN_I2S_DATA, TX_IN_RATE, TX_I2S_SLOT_BITS, TX_I2S_TIMEOUT_MS,
-       TX_USE_RERR ? "G33" : "not used");
+  LOG1("spdif: I2S slave %s (BCK G%d, WS G%d, DIN G%d, %d Hz, slot %d bit, timeout %d ms)", ok ? "ok" : "FAILED",
+       PIN_I2S_BCK, PIN_I2S_WS, PIN_I2S_DATA, TX_IN_RATE, TX_I2S_SLOT_BITS, TX_I2S_TIMEOUT_MS);
   if (ok) xTaskCreatePinnedToCore(taskI2s, "spdif", 4096, nullptr, 5, nullptr, 1);
 #elif TX_AUDIO_SOURCE == 2
   LOG1("spdif: converter test (%d Hz tone at %d Hz %+d ppm)", TX_SRC_TEST_HZ, TX_IN_RATE, TX_SRC_TEST_PPM);
@@ -408,7 +399,6 @@ const char* spdifErrorReason() {
   switch (s_err.load(std::memory_order_relaxed)) {
     case ERR_NONE: return "ok";
     case ERR_TIMEOUT: return "timeout";
-    case ERR_RERR: return "rerr";
     case ERR_RATE: return "rate";
     default: return "?";
   }
@@ -427,5 +417,6 @@ void spdifTakeStats(SpdifStats* s) {
   s->restarts = s_restarts.load(std::memory_order_relaxed);
   s->adjPpm = s_adjPpm.load(std::memory_order_relaxed);
   s->rateHz = s_rateHz.load(std::memory_order_relaxed);
+  s->rawFrames = s_rawFrames.exchange(0, std::memory_order_relaxed);
 }
 #endif  // TX_AUDIO_SOURCE != 0

@@ -15,11 +15,12 @@ struct SpdifStats {
   uint32_t procUsMax;    // 1ブロックの変換の最大時間（µs）
   uint32_t restarts;     // エラーから戻ったときに I2S を止めて再開した回数
   int32_t adjPpm;        // 比率の調整（ppm）
-  uint32_t rateHz;       // 最後に測った受信レート（Hz。TX_AUDIO_SOURCE=1）
+  uint32_t rateHz;       // 最後に測った受信レート（Hz。エラー中も測る。TX_AUDIO_SOURCE=1）
+  uint32_t rawFrames;    // 診断用: 受け取ったフレーム数（エラー中・時間切れで一部だけの分も含む。TX_AUDIO_SOURCE=1）
 };
 
 void spdifBegin();                           // I2S（または試験の入力）と受信タスクを始める
 int32_t spdifRead(Frame* data, int32_t len); // BT タスク（onFrames）から。len フレームを必ず埋める（足りない分は無音）
-bool spdifError();                           // 受信タイムアウト・受信レートの外れ・RERR=H で、エラー中（復帰の待ちを含む）
-const char* spdifErrorReason();              // "ok" / "timeout" / "rate" / "rerr"
+bool spdifError();                           // 受信タイムアウト・受信レートの外れで、エラー中（復帰の待ちを含む）
+const char* spdifErrorReason();              // "ok" / "timeout" / "rate"
 void spdifTakeStats(SpdifStats* s);          // 前回からの計測を取り出す（loop() から）

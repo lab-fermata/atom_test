@@ -22,7 +22,7 @@ TX（`fermata SPDIF`）と接続している間、M5Dial の曲名の欄に S/PD
 | TX の状態 | 曲名 |
 |---|---|
 | 正常 | `S/PDIF PLAYING` |
-| エラーを検出中（RERR、I2S 受信タイムアウト。software.md 2.2節） | `S/PDIF ERROR` |
+| エラーを検出中（受信レート、I2S 受信タイムアウト。software.md 2.2節） | `S/PDIF ERROR` |
 
 スマホ・PC と接続しているときは、今までどおり相手のメタ情報を出す。
 

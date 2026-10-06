@@ -1,5 +1,5 @@
 // tx_main.cpp — TX の役割の入口: 状態の管理、LED、ボタン、切断時の再起動（atom_tx_test_instructions.md 4.1節）、
-// S/PDIF が無いときは BT 接続しない（TX_BT_NEED_SPDIF）
+// BT 接続を始める時機と、S/PDIF が無いときは BT 接続しない（TX_BT_NEED_SPDIF）
 // 形は BT_SPEAKER/atom_a2dp/rx_main.cpp（c0b5439）を参考にした
 #include <M5Unified.h>
 #include <esp_a2dp_api.h>
@@ -17,11 +17,20 @@ static bool s_error = false;      // エラー中（S/PDIF のエラー また�
 // 起動時にボタンが押されていた（長押しの再起動から押し続けている）。最初に離したときは短押しとして扱わない
 static bool s_ignoreRelease = false;
 
-// 模擬エラーは、ソフトウェアの再起動（ESP.restart()）をまたいで覚えておく（S/PDIF が途絶えたまま再起動した状態を
-// 模擬するため）。電源投入・長押しの再起動では消す
+// 模擬エラーと再起動の理由は、ソフトウェアの再起動（ESP.restart()）をまたいで覚えておく（模擬エラーは S/PDIF が
+// 途絶えたまま再起動した状態を模擬するため）。電源投入では消す。長押しの再起動では模擬エラーも消す
 static constexpr uint32_t kRtcMagic = 0x53504446;  // "SPDF"
 RTC_NOINIT_ATTR static uint32_t s_rtcMagic;
 RTC_NOINIT_ATTR static uint32_t s_rtcSimError;
+RTC_NOINIT_ATTR static uint32_t s_rtcBoot;  // 次の起動のときの BT の始め方（BootMode）
+
+// BT 接続を始める時機（config.h の「BT 接続を始める時機」）
+enum BootMode : uint32_t {
+  BOOT_NORMAL = 0,          // すぐ始める（電源投入・長押しの再起動）
+  BOOT_AFTER_DISCONNECT,    // 起動から TX_RECONNECT_HOLD_MS 待ってから始める（切断で再起動した）
+  BOOT_WAIT_SPDIF,          // S/PDIF の正常が TX_BT_START_OK_MS 続いてから始める（S/PDIF が無いので再起動した）
+};
+static BootMode s_boot = BOOT_NORMAL;
 
 static void setSimError(bool on) {
   s_simError = on;
@@ -53,7 +62,10 @@ static void updateError() {
   }
 }
 
-static void restart(const char* why, uint32_t delayMs, bool ledOff) {
+// next: 次の起動のときの BT の始め方
+static void restart(const char* why, uint32_t delayMs, bool ledOff, BootMode next) {
+  s_rtcBoot = next;
+  s_rtcMagic = kRtcMagic;
   LOG1("restart: %s (after %lums)", why, (unsigned long)delayMs);
   if (ledOff) ledSet(LED_OFF);  // SK6812 は給電されている間は色を保持する
   Serial.flush();
@@ -61,33 +73,53 @@ static void restart(const char* why, uint32_t delayMs, bool ledOff) {
   ESP.restart();
 }
 
-// S/PDIF が無いときは BT 接続しない: 正常が TX_BT_START_OK_MS 続いたら A2DP を始め、始めた後にエラーが
-// TX_BT_STOP_ERR_MS 続いたら再起動して待ちに戻る（RX は TX の切断で再起動し、スマホ等がつなげるようになる）
+// BT 接続を始める時機（s_boot）と、始めた後に S/PDIF が TX_BT_STOP_ERR_MS 無ければ再起動して S/PDIF を待つ
 static void btGate() {
-#if TX_BT_NEED_SPDIF
-  static uint32_t since = 0;  // 今の状態（始める前は正常、始めた後はエラー）が始まった時刻（0: その状態でない）
+  // 今の状態（始める前は正常、始めた後はエラー）が始まった時刻。記録しているかは timing で持つ
+  // （以前は 0 を「未記録」にするため since = now | 1 としていたが、now が偶数だと since が now より 1 先になり、
+  //  now - since が桁あふれして、待たずに始める・再起動するバグがあった）
+  static uint32_t since = 0;
+  static bool timing = false;
   uint32_t now = millis();
   if (!txAudioBtStarted()) {
-    if (s_error) {
-      if (since != 0) LOG1("bt: waiting for S/PDIF");
-      since = 0;
-      return;
-    }
-    if (since == 0) since = now | 1;
-    if (now - since >= TX_BT_START_OK_MS) {
-      LOG1("bt: S/PDIF ok for %d ms -> start A2DP", TX_BT_START_OK_MS);
-      since = 0;
+    if (s_boot == BOOT_NORMAL) {
+      LOG1("bt: start A2DP (now %lu)", (unsigned long)now);
       txAudioStartBt();
+    } else if (s_boot == BOOT_AFTER_DISCONNECT) {
+      if ((int32_t)(now - (uint32_t)TX_RECONNECT_HOLD_MS) >= 0) {  // 起動直後なので符号付きで比べてよい（0 でも警告を出さない）
+        LOG1("bt: %d ms after restart on disconnect -> start A2DP (now %lu)", TX_RECONNECT_HOLD_MS, (unsigned long)now);
+        txAudioStartBt();
+      }
+    } else {  // BOOT_WAIT_SPDIF
+      if (s_error) {
+        if (timing) LOG1("bt: waiting for S/PDIF");
+        timing = false;
+        return;
+      }
+      if (!timing) {
+        timing = true;
+        since = now;
+      }
+      if (now - since >= TX_BT_START_OK_MS) {
+        LOG1("bt: S/PDIF ok for %d ms -> start A2DP (ok since %lu, now %lu)", TX_BT_START_OK_MS, (unsigned long)since,
+             (unsigned long)now);
+        timing = false;
+        txAudioStartBt();
+      }
     }
-  } else {
-    if (!s_error) {
-      since = 0;
-      return;
-    }
-    if (since == 0) since = now | 1;
-    if (now - since >= TX_BT_STOP_ERR_MS) {
-      restart("no S/PDIF for TX_BT_STOP_ERR_MS: stop BT and wait", 5, false);
-    }
+    return;
+  }
+#if TX_BT_NEED_SPDIF
+  if (!s_error) {
+    timing = false;
+    return;
+  }
+  if (!timing) {
+    timing = true;
+    since = now;
+  }
+  if (now - since >= TX_BT_STOP_ERR_MS) {
+    restart("no S/PDIF for TX_BT_STOP_ERR_MS: stop BT and wait for S/PDIF", 5, false, BOOT_WAIT_SPDIF);
   }
 #endif
 }
@@ -97,15 +129,14 @@ void txSetup() {
   s_ignoreRelease = (digitalRead(PIN_BUTTON) == LOW);
   if (s_ignoreRelease) LOG1("button held at boot: ignore the first release");
   bool keep = (esp_reset_reason() == ESP_RST_SW && s_rtcMagic == kRtcMagic);
+  s_boot = (keep && s_rtcBoot <= BOOT_WAIT_SPDIF) ? (BootMode)s_rtcBoot : BOOT_NORMAL;
+  s_rtcBoot = BOOT_NORMAL;  // 次にどの再起動かを書かずに再起動したら（例外など）すぐ始める
   setSimError(keep && s_rtcSimError);
   if (s_simError) LOG1("simulated error: ON (kept over restart)");
   txAudioSetup();
-#if TX_BT_NEED_SPDIF
-  LOG1("bt: start A2DP after S/PDIF ok for %d ms, stop after no S/PDIF for %d ms", TX_BT_START_OK_MS,
-       TX_BT_STOP_ERR_MS);
-#else
-  txAudioStartBt();
-#endif
+  static const char* const kBootName[] = {"start now", "hold after disconnect", "wait for S/PDIF"};
+  LOG1("bt: boot mode %s (hold %d ms, S/PDIF ok %d ms, stop after no S/PDIF %d ms)", kBootName[s_boot],
+       TX_RECONNECT_HOLD_MS, TX_BT_START_OK_MS, TX_BT_STOP_ERR_MS);
   updateError();
   updateLed();
 }
@@ -114,7 +145,7 @@ void txLoop() {
   // ボタン（G39）: TX_LONG_PRESS_MS 以上で再起動（模擬エラーも消す）、それより短い押下（離したとき）は模擬エラーの切り替え
   if (M5.BtnA.pressedFor(TX_LONG_PRESS_MS)) {
     setSimError(false);
-    restart("button long press", 5, true);
+    restart("button long press", 5, true, BOOT_NORMAL);
   }
   if (M5.BtnA.wasReleased() && s_ignoreRelease) {
     s_ignoreRelease = false;
@@ -141,7 +172,7 @@ void txLoop() {
   if (txAudioWasConnected() && state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     s_connected = false;
     updateLed();
-    restart("disconnected", TX_RESTART_DELAY_MS, false);
+    restart("disconnected", TX_RESTART_DELAY_MS, false, BOOT_AFTER_DISCONNECT);
   }
 
   updateError();

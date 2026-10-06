@@ -42,6 +42,10 @@ static std::atomic<uint32_t> s_psthRspSeq{0};   // パススルーの応答を�
 static std::atomic<uint32_t> s_psthRsp{0};      // 最後の応答: key_code << 16 | key_state << 8 | rsp_code
 
 class TxSource : public BluetoothA2DPSource {
+ public:
+  // ライブラリの送出の状態（BluetoothA2DPSource.cpp の APP_AV_MEDIA_STATE_IDLE = 0）。BT 側のタスクが書き換えるので目安
+  bool mediaIdle() const { return s_media_state == 0; }
+
  protected:
   void bt_av_hdl_avrc_ct_evt(uint16_t event, void* p_param) override {
     BluetoothA2DPSource::bt_av_hdl_avrc_ct_evt(event, p_param);
@@ -307,6 +311,29 @@ void txAudioLoop() {
   if (s_evAudioState.exchange(false, std::memory_order_relaxed)) {
     LOG1("audio state: %s", audioStateName(s_audioState.load(std::memory_order_relaxed)));
   }
+
+#if TX_MEDIA_KICK_MS > 0
+  // 送出を早く始める: ライブラリは 10 秒周期のハートビート（connTmr）のたびに ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY を送り、
+  // その応答で送出を始める（bt_app_av_media_proc）ので、接続から音が出るまで最大約 10 秒かかる。接続してから
+  // TX_MEDIA_KICK_MS 後に、送出の状態が IDLE なら同じものをこちらから送る（応答の後の START はライブラリが行う）。
+  // 始まらなければ TX_MEDIA_KICK_RETRY_MS ごとに送り直す（ハートビートと重なると状態が乱れるおそれがあるので IDLE のときだけ）
+  {
+    static bool wasConn = false;
+    static uint32_t kickAt = 0;
+    bool conn = s_connState == ESP_A2D_CONNECTION_STATE_CONNECTED;
+    uint32_t nowK = millis();
+    if (conn && !wasConn) kickAt = nowK + TX_MEDIA_KICK_MS;
+    wasConn = conn;
+    if (conn && s_audioState.load(std::memory_order_relaxed) != ESP_A2D_AUDIO_STATE_STARTED &&
+        (int32_t)(nowK - kickAt) >= 0) {
+      kickAt = nowK + TX_MEDIA_KICK_RETRY_MS;
+      if (s_srcp->mediaIdle()) {
+        esp_err_t e = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+        LOG1("media: check src ready (kick)%s", e == ESP_OK ? "" : " failed");
+      }
+    }
+  }
+#endif
 #if TX_AVRCP_STATUS
   avrcpLoop();
 #endif
@@ -328,9 +355,11 @@ void txAudioLoop() {
     // 入力・変換: 入力／変換後／BT に渡したフレーム数、足りなかった回数、あふれ、リングバッファの量、比率の調整、変換の時間
     SpdifStats s;
     spdifTakeStats(&s);
-    LOG2("spdif %s (rate %lu Hz): in %lu out %lu read %lu /s, under %lu over %lu, ring %lu-%lu, adj %ld ppm, proc max %luus, "
-         "restarts %lu",
-         spdifErrorReason(), (unsigned long)s.rateHz, (unsigned long)s.inFrames, (unsigned long)s.outFrames, (unsigned long)s.readFrames,
+    // rate: 受信レート（エラー中も測る）、raw: 受け取ったフレーム数（エラー中も数える。診断用）
+    LOG2("spdif %s (rate %lu Hz, raw %lu/s): in %lu out %lu read %lu /s, under %lu over %lu, ring %lu-%lu, "
+         "adj %ld ppm, proc max %luus, restarts %lu",
+         spdifErrorReason(), (unsigned long)s.rateHz, (unsigned long)s.rawFrames,
+         (unsigned long)s.inFrames, (unsigned long)s.outFrames, (unsigned long)s.readFrames,
          (unsigned long)s.underruns, (unsigned long)s.overruns, (unsigned long)s.ringMin, (unsigned long)s.ringMax,
          (long)s.adjPpm, (unsigned long)s.procUsMax, (unsigned long)s.restarts);
 #endif
