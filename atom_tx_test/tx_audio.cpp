@@ -355,13 +355,15 @@ void txAudioLoop() {
     // 入力・変換: 入力／変換後／BT に渡したフレーム数、足りなかった回数、あふれ、リングバッファの量、比率の調整、変換の時間
     SpdifStats s;
     spdifTakeStats(&s);
-    // rate: 受信レート（エラー中も測る）、raw: 受け取ったフレーム数（エラー中も数える。診断用）
+    // rate: 受信レート（エラー中も測る）、raw: 受け取ったフレーム数（エラー中も数える。診断用）、
+    // nverr: G33 のレベル（変化の回数、H の時間、いちばん短い H のパルス。観察用）
     LOG2("spdif %s (rate %lu Hz, raw %lu/s): in %lu out %lu read %lu /s, under %lu over %lu, ring %lu-%lu, "
-         "adj %ld ppm, proc max %luus, restarts %lu",
+         "adj %ld ppm, proc max %luus, restarts %lu, nverr %c (edges %lu, H %lu ms, min H %lu us)",
          spdifErrorReason(), (unsigned long)s.rateHz, (unsigned long)s.rawFrames,
          (unsigned long)s.inFrames, (unsigned long)s.outFrames, (unsigned long)s.readFrames,
          (unsigned long)s.underruns, (unsigned long)s.overruns, (unsigned long)s.ringMin, (unsigned long)s.ringMax,
-         (long)s.adjPpm, (unsigned long)s.procUsMax, (unsigned long)s.restarts);
+         (long)s.adjPpm, (unsigned long)s.procUsMax, (unsigned long)s.restarts, s.nverr ? 'H' : 'L',
+         (unsigned long)s.nverrEdges, (unsigned long)s.nverrHighMs, (unsigned long)s.nverrMinHUs);
 #endif
     lastLog = now;
   }

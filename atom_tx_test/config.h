@@ -43,6 +43,7 @@
 #define PIN_ROLE      25  // 判定ジャンパ（H=RX / L=TX）
 #define PIN_LED       27  // 本体 RGB LED（M5.Led が使う）
 #define PIN_BUTTON    39  // 本体ボタン
+#define PIN_NVERR     33  // TX: ← CS8416 NV/RERR（キットはプルダウンで NVERR。H=エラー・アンロック）。エラーの判定とスリープからの起床。RX: IR_RX
 
 #define LED_LEVEL        64   // 点灯時の輝度（0-255。本体LEDは明るいので控えめ）
 #define LED_BLINK_MS     1000 // ゆっくり点滅の半周期
@@ -183,6 +184,28 @@
 #endif
 #ifndef TX_BT_STOP_ERR_MS
 #define TX_BT_STOP_ERR_MS 30000
+#endif
+
+// ---- S/PDIF を待つ間のディープスリープ（省電力・発熱・不要な電波の対策。ユーザーの判断、2026-10-08）----
+// S/PDIF を待っている間（上の「S/PDIF が TX_BT_STOP_ERR_MS 無い」で再起動した後）にエラーなら、LED を消して寝る。
+// - NVERR（G33）が H（アンロック）: G33 が L（ロック）になったら起きる（ext0）
+// - NVERR が L なのにエラー（DIR の電源断、48kHz 以外でロック、模擬エラー）: 起動から TX_SLEEP_CHECK_MS 待って
+//   受信レートで確かめてから寝て、TX_SLEEP_TIMER_MS ごとに起きて確かめる（ext0 は L で起き続けるので使わない）
+// - ボタン（G39）でも起きる（ext1）。ボタンで起きたら TX_SLEEP_BUTTON_AWAKE_MS は寝ない（LED も点ける）
+// 起きたら「S/PDIF を待つ」起動になる（S/PDIF の正常が TX_BT_START_OK_MS 続いたら A2DP を始める）。TX_AUDIO_SOURCE=1 のときだけ
+#ifndef TX_SLEEP_WAIT_SPDIF
+#define TX_SLEEP_WAIT_SPDIF 1
+#endif
+#ifndef TX_SLEEP_TIMER_MS
+#define TX_SLEEP_TIMER_MS 5000
+#endif
+// NVERR が L のときに寝るまでの起動からの時間（ms）。I2S の開始（約 0.4 秒）から受信レートの窓 2 つ（エラーからの
+// 復帰の条件）を測り終える約 1.4 秒より長くする
+#ifndef TX_SLEEP_CHECK_MS
+#define TX_SLEEP_CHECK_MS 2500
+#endif
+#ifndef TX_SLEEP_BUTTON_AWAKE_MS
+#define TX_SLEEP_BUTTON_AWAKE_MS 10000
 #endif
 
 // ---- 変換の試験（TX_AUDIO_SOURCE=2）----

@@ -1,15 +1,19 @@
 // tx_main.cpp — TX の役割の入口: 状態の管理、LED、ボタン、切断時の再起動（atom_tx_test_instructions.md 4.1節）、
-// BT 接続を始める時機と、S/PDIF が無いときは BT 接続しない（TX_BT_NEED_SPDIF）
+// BT 接続を始める時機と、S/PDIF が無いときは BT 接続しない（TX_BT_NEED_SPDIF）、S/PDIF を待つ間のディープスリープ
+// （TX_SLEEP_WAIT_SPDIF）
 // 形は BT_SPEAKER/atom_a2dp/rx_main.cpp（c0b5439）を参考にした
 #include <M5Unified.h>
 #include <esp_a2dp_api.h>
 #include <esp_attr.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include "tx_main.h"
 #include "config.h"
 #include "dial_link.h"
 #include "status_led.h"
 #include "tx_audio.h"
+#include "tx_spdif.h"
 
 static bool s_connected = false;  // loop() 側で確定した接続状態
 static bool s_simError = false;   // 模擬エラー（S/PDIF のエラーの代わり）
@@ -23,6 +27,7 @@ static constexpr uint32_t kRtcMagic = 0x53504446;  // "SPDF"
 RTC_NOINIT_ATTR static uint32_t s_rtcMagic;
 RTC_NOINIT_ATTR static uint32_t s_rtcSimError;
 RTC_NOINIT_ATTR static uint32_t s_rtcBoot;  // 次の起動のときの BT の始め方（BootMode）
+RTC_NOINIT_ATTR static uint32_t s_rtcSleeps;  // 続けて寝た回数（ログ用。S/PDIF を待つ起動以外で 0 に戻す）
 
 // BT 接続を始める時機（config.h の「BT 接続を始める時機」）
 enum BootMode : uint32_t {
@@ -31,6 +36,17 @@ enum BootMode : uint32_t {
   BOOT_WAIT_SPDIF,          // S/PDIF の正常が TX_BT_START_OK_MS 続いてから始める（S/PDIF が無いので再起動した）
 };
 static BootMode s_boot = BOOT_NORMAL;
+static bool s_wokeByButton = false;  // ボタンでスリープから起きた（TX_SLEEP_BUTTON_AWAKE_MS は寝ない）
+
+// S/PDIF を待っていて、LED を消しておくとき（寝ている間と同じ表示。ボタンで起きた後は点ける）
+static bool waitDark() {
+#if TX_AUDIO_SOURCE == 1 && TX_SLEEP_WAIT_SPDIF
+  return s_boot == BOOT_WAIT_SPDIF && !txAudioBtStarted() &&
+         !(s_wokeByButton && millis() < (uint32_t)TX_SLEEP_BUTTON_AWAKE_MS);
+#else
+  return false;
+#endif
+}
 
 static void setSimError(bool on) {
   s_simError = on;
@@ -40,7 +56,9 @@ static void setSimError(bool on) {
 
 // 色（赤・青）で S/PDIF のエラーの有無、点滅・点灯で BT の接続状態を表す（software.md 2.4節）
 static void updateLed() {
-  if (s_connected) {
+  if (waitDark()) {
+    ledSet(LED_OFF);
+  } else if (s_connected) {
     ledSet(s_error ? LED_RED : LED_BLUE_ON);
   } else {
     ledSet(s_error ? LED_RED_BLINK : LED_BLUE_BLINK);
@@ -73,6 +91,33 @@ static void restart(const char* why, uint32_t delayMs, bool ledOff, BootMode nex
   ESP.restart();
 }
 
+#if TX_AUDIO_SOURCE == 1 && TX_SLEEP_WAIT_SPDIF
+// S/PDIF を待っていてエラーのとき、寝る（config.h の「S/PDIF を待つ間のディープスリープ」）。寝ると戻らない
+static void sleepIfIdle(uint32_t now) {
+  if (s_wokeByButton && now < (uint32_t)TX_SLEEP_BUTTON_AWAKE_MS) return;
+  if (digitalRead(PIN_BUTTON) == LOW) return;  // 押している間は寝ない（ボタンですぐ起きるため）
+  bool nv = spdifNverr();
+  // NVERR が L なのにエラー: S/PDIF をロックした直後かもしれないので、受信レートで確かめ終わるまで待つ
+  if (!nv && now < (uint32_t)TX_SLEEP_CHECK_MS) return;
+  s_rtcBoot = BOOT_WAIT_SPDIF;
+  s_rtcMagic = kRtcMagic;
+  s_rtcSleeps++;
+  LOG1("sleep: %s (spdif %s, nverr %c) -> deep sleep #%lu, wake on %s or button", s_simError ? "simulated error" : "no S/PDIF",
+       txAudioSpdifReason(), nv ? 'H' : 'L', (unsigned long)s_rtcSleeps, nv ? "nverr L" : "timer");
+  ledSet(LED_OFF);  // SK6812 は給電されている間は色を保持する
+  // 模擬エラー・起動の理由（RTC_NOINIT_ATTR は RTC SLOW のメモリ）を寝ている間も保つ
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_ON);
+  if (nv) {
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_NVERR, 0);  // ロック（L）で起きる。CS8416 が駆動するのでプルは要らない
+  } else {
+    esp_sleep_enable_timer_wakeup((uint64_t)TX_SLEEP_TIMER_MS * 1000);  // L の間は ext0 だと起き続けるのでタイマー
+  }
+  esp_sleep_enable_ext1_wakeup(1ULL << PIN_BUTTON, ESP_EXT1_WAKEUP_ALL_LOW);  // G39: 外付けのプルアップ、押すと L
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+#endif
+
 // BT 接続を始める時機（s_boot）と、始めた後に S/PDIF が TX_BT_STOP_ERR_MS 無ければ再起動して S/PDIF を待つ
 static void btGate() {
   // 今の状態（始める前は正常、始めた後はエラー）が始まった時刻。記録しているかは timing で持つ
@@ -94,6 +139,9 @@ static void btGate() {
       if (s_error) {
         if (timing) LOG1("bt: waiting for S/PDIF");
         timing = false;
+#if TX_AUDIO_SOURCE == 1 && TX_SLEEP_WAIT_SPDIF
+        sleepIfIdle(now);
+#endif
         return;
       }
       if (!timing) {
@@ -125,11 +173,26 @@ static void btGate() {
 }
 
 void txSetup() {
+  esp_reset_reason_t rr = esp_reset_reason();
+  bool fromSleep = (rr == ESP_RST_DEEPSLEEP);
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (fromSleep) {
+    // 起床に使ったピンは RTC IO のままなので、普通の GPIO に戻す（G39 は M5Unified も GPIO.in1 で読む）
+    rtc_gpio_deinit((gpio_num_t)PIN_NVERR);
+    rtc_gpio_deinit((gpio_num_t)PIN_BUTTON);
+    s_wokeByButton = (cause == ESP_SLEEP_WAKEUP_EXT1);
+  }
   // G39 は外付けのプルアップで、押すと L（M5Unified も GPIO.in1 を反転して読む）。入力専用なので pinMode は要らない
   s_ignoreRelease = (digitalRead(PIN_BUTTON) == LOW);
   if (s_ignoreRelease) LOG1("button held at boot: ignore the first release");
-  bool keep = (esp_reset_reason() == ESP_RST_SW && s_rtcMagic == kRtcMagic);
+  bool keep = ((rr == ESP_RST_SW || fromSleep) && s_rtcMagic == kRtcMagic);
   s_boot = (keep && s_rtcBoot <= BOOT_WAIT_SPDIF) ? (BootMode)s_rtcBoot : BOOT_NORMAL;
+  if (fromSleep) s_boot = BOOT_WAIT_SPDIF;  // 寝るのは S/PDIF を待っているときだけ
+  if (!(keep && fromSleep)) s_rtcSleeps = 0;  // 寝て起きたときだけ数え続ける
+  if (fromSleep) {
+    static const char* const kCause[] = {"?", "?", "nverr L", "button", "timer"};  // EXT0=2, EXT1=3, TIMER=4
+    LOG1("sleep: woke by %s after sleep #%lu", (cause >= 2 && cause <= 4) ? kCause[cause] : "?", (unsigned long)s_rtcSleeps);
+  }
   s_rtcBoot = BOOT_NORMAL;  // 次にどの再起動かを書かずに再起動したら（例外など）すぐ始める
   setSimError(keep && s_rtcSimError);
   if (s_simError) LOG1("simulated error: ON (kept over restart)");

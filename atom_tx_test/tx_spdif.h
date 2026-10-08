@@ -17,10 +17,16 @@ struct SpdifStats {
   int32_t adjPpm;        // 比率の調整（ppm）
   uint32_t rateHz;       // 最後に測った受信レート（Hz。エラー中も測る。TX_AUDIO_SOURCE=1）
   uint32_t rawFrames;    // 診断用: 受け取ったフレーム数（エラー中・時間切れで一部だけの分も含む。TX_AUDIO_SOURCE=1）
+  // NVERR（G33）の観察（TX_AUDIO_SOURCE=1）
+  bool nverr;            // 今のレベル（true=H）
+  uint32_t nverrEdges;   // 変化の回数
+  uint32_t nverrHighMs;  // H だった時間の合計（ms）
+  uint32_t nverrMinHUs;  // いちばん短い H のパルスの幅（µs。0: H のパルスが終わらなかった）
 };
 
 void spdifBegin();                           // I2S（または試験の入力）と受信タスクを始める
 int32_t spdifRead(Frame* data, int32_t len); // BT タスク（onFrames）から。len フレームを必ず埋める（足りない分は無音）
-bool spdifError();                           // 受信タイムアウト・受信レートの外れで、エラー中（復帰の待ちを含む）
-const char* spdifErrorReason();              // "ok" / "timeout" / "rate"
+bool spdifError();                           // 受信タイムアウト・受信レートの外れ・NVERR の H で、エラー中（復帰の待ちを含む）
+const char* spdifErrorReason();              // "ok" / "timeout" / "rate" / "nverr"
 void spdifTakeStats(SpdifStats* s);          // 前回からの計測を取り出す（loop() から）
+bool spdifNverr();                           // NVERR（G33）の今のレベル（true=H。TX_AUDIO_SOURCE=1 以外は false）

@@ -2,8 +2,9 @@
 //
 // - I2S は ESP-IDF の i2s_std を直接使う（コア 3.3.9 は IDF 5.5。driver/i2s_std.h）。CS8416 がマスタ、ESP32 はスレーブ。
 //   BCK=G22、WS=G19、DIN=G23（hardware.md 4.1節）。フォーマットは I2S（Philips）、スロット幅 TX_I2S_SLOT_BITS [OI-01]
-// - 受信は専用のタスク（コア1）で行う。i2s_channel_read() が TX_I2S_TIMEOUT_MS の間データを返さない、または
-//   受信レート（LRCK）が入力のレートから外れていたら、エラーとして受信データを捨てる（BT には無音が渡る）。エラーが消えて TX_RECOVER_MS 正常が続いたら、
+// - 受信は専用のタスク（コア1）で行う。i2s_channel_read() が TX_I2S_TIMEOUT_MS の間データを返さない、
+//   受信レート（LRCK）が入力のレートから外れている、または CS8416 の NVERR（G33）が H なら、
+//   エラーとして受信データを捨てる（BT には無音が渡る）。エラーが消えて TX_RECOVER_MS 正常が続いたら、
 //   I2S を止めて再開してから送出を再開する（software.md 2.2節。L/R の入れ替わり・ビットずれの対策 [OI-05]）
 // - 変換は窓付き sinc の多相 FIR（32 タップ × 64 相、相の間は線形補間、float）。比率は「入力のレート／44.1k」を、
 //   リングバッファの量が目標（TX_RING_TARGET_MS）に保たれるように少しだけ変える（クロックのずれの吸収。software.md 2.1節）
@@ -14,6 +15,7 @@
 #include <math.h>
 #include <esp_timer.h>
 #include <driver/i2s_std.h>
+#include <soc/gpio_struct.h>
 #include "tx_spdif.h"
 #include "config.h"
 #include "dial_link.h"
@@ -28,6 +30,7 @@ int32_t spdifRead(Frame* data, int32_t len) {
 bool spdifError() { return false; }
 const char* spdifErrorReason() { return "ok"; }
 void spdifTakeStats(SpdifStats* s) { memset(s, 0, sizeof(*s)); }
+bool spdifNverr() { return false; }
 #else
 
 static constexpr int kOutRate = 44100;
@@ -50,7 +53,7 @@ static bool s_priming = true;                  // BT タスクだけが使う: �
 static std::atomic<uint32_t> s_lastReadMs{0};  // BT が最後にデータを要求した時刻（ms）
 
 // ---- 状態・計測 ----
-enum ErrReason : int { ERR_NONE = 0, ERR_TIMEOUT, ERR_RATE };
+enum ErrReason : int { ERR_NONE = 0, ERR_TIMEOUT, ERR_RATE, ERR_NVERR };
 static std::atomic<uint32_t> s_rateHz{0};      // 最後に測った受信レート（Hz。エラー中も測る）
 static std::atomic<uint32_t> s_rawFrames{0};   // 診断用: 受け取ったフレーム数（エラー中も数える。前回のログ以降）
 static std::atomic<int> s_err{ERR_TIMEOUT};    // 起動直後はデータが来るまでエラー扱い
@@ -238,6 +241,54 @@ static bool i2sBegin() {
   return i2s_channel_enable(s_rx) == ESP_OK;
 }
 
+// NVERR（G33）: CS8416 は PLL のロックが外れると H（DS578F3。キットは起動時のプルダウンで NVERR＝Validity 以外の
+// エラー）。H ならエラー（短い H も無視しない。ユーザーの判断、2026-10-08）。受信タスクは 1 ブロック（2ms、時間切れなら
+// 20ms）ごとにしか見ないので、その間の短い H は割り込みで覚えておく（s_nvLatch）。
+// 観察用に、変化の回数・H の時間・いちばん短い H のパルスも数える（1 秒ごとのログ）
+// 割り込み（コア0／1 のどちらでも）とログの読み出しが同じ変数を触るので、スピンロックで守る（IRAM で動く）
+static portMUX_TYPE s_nvMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_nvEdges = 0, s_nvHighUs = 0, s_nvMinHUs = UINT32_MAX;
+static bool s_nvHigh = false;   // 今 H か（割り込みで見たレベル）
+static bool s_nvLatch = false;  // 前に受信タスクが見てから H になった
+static uint32_t s_nvHighT0 = 0; // H になった時刻、またはログで H の時間を数えた時刻（µs の下位 32bit。差だけ使う）
+
+static inline bool nverrLevel() { return (GPIO.in1.data >> (PIN_NVERR - 32)) & 1; }  // G33 は in1 の bit1
+
+static void IRAM_ATTR nverrIsr() {
+  uint32_t t = (uint32_t)esp_timer_get_time();
+  bool h = nverrLevel();
+  portENTER_CRITICAL_ISR(&s_nvMux);
+  s_nvEdges++;
+  if (h && !s_nvHigh) {
+    s_nvHigh = true;
+    s_nvLatch = true;
+    s_nvHighT0 = t;
+  } else if (!h && s_nvHigh) {
+    s_nvHigh = false;
+    uint32_t w = t - s_nvHighT0;
+    s_nvHighUs += w;
+    if (w < s_nvMinHUs) s_nvMinHUs = w;  // ログをまたいだパルスは短く数える（観察用なので許す）
+  }
+  portEXIT_CRITICAL_ISR(&s_nvMux);
+}
+
+static void nverrBegin() {
+  pinMode(PIN_NVERR, INPUT);  // CS8416 が駆動する（キットのプルダウンあり）。内部のプルは使わない
+  s_nvHigh = nverrLevel();
+  s_nvHighT0 = (uint32_t)esp_timer_get_time();
+  attachInterrupt(digitalPinToInterrupt(PIN_NVERR), nverrIsr, CHANGE);
+  LOG1("spdif: nverr G%d = %c", PIN_NVERR, nverrLevel() ? 'H' : 'L');
+}
+
+// 受信タスクから: 今 H か、前に見てから H になったか
+static bool nverrSeen() {
+  portENTER_CRITICAL(&s_nvMux);
+  bool latched = s_nvLatch;
+  s_nvLatch = false;
+  portEXIT_CRITICAL(&s_nvMux);
+  return latched || nverrLevel();
+}
+
 // 受信レートの監視: エラー・時間切れに関係なく、受け取ったフレーム数（時間切れで一部だけ受け取った分も含む）を数え、
 // TX_RATE_WINDOW_MS ごとに LRCK の周波数を求めて、エラーの判定に使う。
 // CS8416 は PLL がアンロックすると、出力クロックが VCO の待機の周波数で出続け（データシートでは OLRCK 約 2.925kHz。
@@ -279,9 +330,14 @@ static void taskI2s(void*) {
     size_t got = 0;
     esp_err_t e = i2s_channel_read(s_rx, s_rxBuf, sizeof(s_rxBuf), &got, TX_I2S_TIMEOUT_MS);
     rateUpdate(got);
+    bool nv = nverrSeen();
     int reason = ERR_NONE;
-    if (s_rateBad) {
-      reason = s_rateNoClock ? ERR_TIMEOUT : ERR_RATE;  // ほとんど来ていなければ timeout、来ているが外れていれば rate
+    if (s_rateBad && s_rateNoClock) {
+      reason = ERR_TIMEOUT;  // クロックがほとんど来ていない（DIR の電源断など。NVERR はプルダウンで L に見える）
+    } else if (nv) {
+      reason = ERR_NVERR;    // ロックが外れている（このとき受信レートは待機の周波数で外れていることが多い）
+    } else if (s_rateBad) {
+      reason = ERR_RATE;     // ロックしているがレートが違う（48kHz 以外）
     } else if (e != ESP_OK || got < sizeof(s_rxBuf)) {
       reason = ERR_TIMEOUT;
     }
@@ -348,6 +404,7 @@ void spdifBegin() {
   bool ok = i2sBegin();
   LOG1("spdif: I2S slave %s (BCK G%d, WS G%d, DIN G%d, %d Hz, slot %d bit, timeout %d ms)", ok ? "ok" : "FAILED",
        PIN_I2S_BCK, PIN_I2S_WS, PIN_I2S_DATA, TX_IN_RATE, TX_I2S_SLOT_BITS, TX_I2S_TIMEOUT_MS);
+  nverrBegin();  // 受信タスクが NVERR を見るので先に
   if (ok) xTaskCreatePinnedToCore(taskI2s, "spdif", 4096, nullptr, 5, nullptr, 1);
 #elif TX_AUDIO_SOURCE == 2
   LOG1("spdif: converter test (%d Hz tone at %d Hz %+d ppm)", TX_SRC_TEST_HZ, TX_IN_RATE, TX_SRC_TEST_PPM);
@@ -395,11 +452,18 @@ int32_t spdifRead(Frame* data, int32_t len) {
 
 bool spdifError() { return s_err.load(std::memory_order_relaxed) != ERR_NONE; }
 
+#if TX_AUDIO_SOURCE == 1
+bool spdifNverr() { return nverrLevel(); }
+#else
+bool spdifNverr() { return false; }
+#endif
+
 const char* spdifErrorReason() {
   switch (s_err.load(std::memory_order_relaxed)) {
     case ERR_NONE: return "ok";
     case ERR_TIMEOUT: return "timeout";
     case ERR_RATE: return "rate";
+    case ERR_NVERR: return "nverr";
     default: return "?";
   }
 }
@@ -418,5 +482,26 @@ void spdifTakeStats(SpdifStats* s) {
   s->adjPpm = s_adjPpm.load(std::memory_order_relaxed);
   s->rateHz = s_rateHz.load(std::memory_order_relaxed);
   s->rawFrames = s_rawFrames.exchange(0, std::memory_order_relaxed);
+#if TX_AUDIO_SOURCE == 1
+  // H が続いている分は、ここまでを足して起点を今にする
+  uint32_t now = (uint32_t)esp_timer_get_time();
+  portENTER_CRITICAL(&s_nvMux);
+  uint32_t highUs = s_nvHighUs, minH = s_nvMinHUs, edges = s_nvEdges;
+  if (s_nvHigh) {
+    highUs += now - s_nvHighT0;
+    s_nvHighT0 = now;
+  }
+  s_nvHighUs = 0;
+  s_nvMinHUs = UINT32_MAX;
+  s_nvEdges = 0;
+  portEXIT_CRITICAL(&s_nvMux);
+  s->nverr = nverrLevel();
+  s->nverrEdges = edges;
+  s->nverrHighMs = highUs / 1000;
+  s->nverrMinHUs = (minH == UINT32_MAX) ? 0 : minH;
+#else
+  s->nverr = false;
+  s->nverrEdges = s->nverrHighMs = s->nverrMinHUs = 0;
+#endif
 }
 #endif  // TX_AUDIO_SOURCE != 0
