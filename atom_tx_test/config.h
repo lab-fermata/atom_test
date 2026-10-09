@@ -207,6 +207,14 @@
 #ifndef TX_SLEEP_BUTTON_AWAKE_MS
 #define TX_SLEEP_BUTTON_AWAKE_MS 10000
 #endif
+// S/PDIF を待っていて「ロックしているのにレートが違う」（NVERR が L で理由 rate。例: テレビが 44.1kHz）とき、
+// 寝る前に赤をこの回数だけ短く点滅させる（TX の USB をつながない試験運用で見分けるため。OI-65）。0: しない
+#ifndef TX_SLEEP_RATE_FLASH
+#define TX_SLEEP_RATE_FLASH 3
+#endif
+#ifndef TX_SLEEP_RATE_FLASH_MS
+#define TX_SLEEP_RATE_FLASH_MS 150
+#endif
 
 // ---- 変換の試験（TX_AUDIO_SOURCE=2）----
 

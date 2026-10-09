@@ -31,6 +31,7 @@ bool spdifError() { return false; }
 const char* spdifErrorReason() { return "ok"; }
 void spdifTakeStats(SpdifStats* s) { memset(s, 0, sizeof(*s)); }
 bool spdifNverr() { return false; }
+uint32_t spdifRateHz() { return 0; }
 #else
 
 static constexpr int kOutRate = 44100;
@@ -454,8 +455,10 @@ bool spdifError() { return s_err.load(std::memory_order_relaxed) != ERR_NONE; }
 
 #if TX_AUDIO_SOURCE == 1
 bool spdifNverr() { return nverrLevel(); }
+uint32_t spdifRateHz() { return s_rateHz.load(std::memory_order_relaxed); }
 #else
 bool spdifNverr() { return false; }
+uint32_t spdifRateHz() { return 0; }
 #endif
 
 const char* spdifErrorReason() {

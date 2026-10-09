@@ -30,3 +30,4 @@ bool spdifError();                           // 受信タイムアウト・受�
 const char* spdifErrorReason();              // "ok" / "timeout" / "rate" / "nverr"
 void spdifTakeStats(SpdifStats* s);          // 前回からの計測を取り出す（loop() から）
 bool spdifNverr();                           // NVERR（G33）の今のレベル（true=H。TX_AUDIO_SOURCE=1 以外は false）
+uint32_t spdifRateHz();                      // 最後に測った受信レート（Hz。TX_AUDIO_SOURCE=1 以外は 0）

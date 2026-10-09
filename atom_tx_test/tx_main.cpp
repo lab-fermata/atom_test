@@ -5,6 +5,7 @@
 #include <M5Unified.h>
 #include <esp_a2dp_api.h>
 #include <esp_attr.h>
+#include <string.h>
 #include <esp_system.h>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
@@ -102,8 +103,19 @@ static void sleepIfIdle(uint32_t now) {
   s_rtcBoot = BOOT_WAIT_SPDIF;
   s_rtcMagic = kRtcMagic;
   s_rtcSleeps++;
-  LOG1("sleep: %s (spdif %s, nverr %c) -> deep sleep #%lu, wake on %s or button", s_simError ? "simulated error" : "no S/PDIF",
-       txAudioSpdifReason(), nv ? 'H' : 'L', (unsigned long)s_rtcSleeps, nv ? "nverr L" : "timer");
+  LOG1("sleep: %s (spdif %s, rate %lu Hz, nverr %c) -> deep sleep #%lu, wake on %s or button",
+       s_simError ? "simulated error" : "no S/PDIF", txAudioSpdifReason(), (unsigned long)spdifRateHz(), nv ? 'H' : 'L',
+       (unsigned long)s_rtcSleeps, nv ? "nverr L" : "timer");
+  // ロックしているのにレートが違う（例: テレビが 44.1kHz）: 寝る前に赤を短く点滅させる（ログを見られない試験運用で
+  // 見分けるため。OI-65）。待っている間はほかは消灯のまま
+  if (!nv && strcmp(txAudioSpdifReason(), "rate") == 0) {
+    for (int i = 0; i < TX_SLEEP_RATE_FLASH; i++) {
+      ledSet(LED_RED);
+      delay(TX_SLEEP_RATE_FLASH_MS);
+      ledSet(LED_OFF);
+      delay(TX_SLEEP_RATE_FLASH_MS);
+    }
+  }
   ledSet(LED_OFF);  // SK6812 は給電されている間は色を保持する
   // 模擬エラー・起動の理由（RTC_NOINIT_ATTR は RTC SLOW のメモリ）を寝ている間も保つ
   esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_ON);
